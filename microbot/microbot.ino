@@ -59,6 +59,12 @@ String notifTitle = "";
 String notifMsg = "";
 portMUX_TYPE displayStateMux = portMUX_INITIALIZER_UNLOCKED;
 SemaphoreHandle_t notificationMutex;
+SemaphoreHandle_t buzzerMutex;
+TaskHandle_t displayTaskHandle = NULL;
+bool faceResetRequested = true;
+bool displayRedrawRequested = true;
+bool weatherRefreshRequested = false;
+uint32_t displayStateVersion = 0;
 
 #define PARTICLE_COUNT 6
 
@@ -81,6 +87,7 @@ Particle particles[PARTICLE_COUNT];
 #define MOOD_LOVE 7
 #define MOOD_SUSPICIOUS 8
 int currentMood = MOOD_NORMAL;
+bool manualMood = false;
 
 String city;         // Loaded from Preferences
 String countryCode;  // Loaded from Preferences
@@ -94,6 +101,8 @@ float feelsLike = 0.0;
 int humidity = 0;
 String weatherMain = "Loading";
 String weatherDesc = "Wait...";
+bool weatherDataAvailable = false;
+bool forecastDataAvailable = false;
 const char* TELEGRAM_OK = "\xE2\x9C\x85 ";
 
 struct ForecastDay {
@@ -130,14 +139,22 @@ struct Eye {
   unsigned long lastBlink;
   unsigned long nextBlinkTime;
 
-  void init(float _x, float _y, float _w, float _h) {
+  void reset(float _x, float _y, float _w, float _h, unsigned long now) {
     x = targetX = _x;
     y = targetY = _y;
     w = targetW = _w;
     h = targetH = _h;
     pupilX = targetPupilX = 0;
     pupilY = targetPupilY = 0;
-    nextBlinkTime = millis() + random(1000, 4000);
+    velX = velY = velW = velH = 0;
+    pVelX = pVelY = 0;
+    blinking = false;
+    lastBlink = now;
+    nextBlinkTime = now + random(1000, 4000);
+  }
+
+  void init(float _x, float _y, float _w, float _h) {
+    reset(_x, _y, _w, _h, millis());
   }
 
   void update() {
@@ -171,6 +188,60 @@ Eye leftEye, rightEye;
 unsigned long lastSaccade = 0;
 unsigned long saccadeInterval = 3000;
 float breathVal = 0;
+unsigned long breathStart = 0;
+
+void resetEyeAnimationState(int mood) {
+  float leftW = 36;
+  float leftH = 36;
+  float rightW = 36;
+  float rightH = 36;
+
+  switch (mood) {
+    case MOOD_HAPPY:
+    case MOOD_LOVE:
+    case MOOD_EXCITED:
+      leftW = rightW = 40;
+      leftH = rightH = 32;
+      break;
+    case MOOD_SURPRISED:
+      leftW = rightW = 30;
+      leftH = rightH = 45;
+      break;
+    case MOOD_SLEEPY:
+      leftW = rightW = 38;
+      leftH = rightH = 30;
+      break;
+    case MOOD_ANGRY:
+      leftW = rightW = 34;
+      leftH = rightH = 32;
+      break;
+    case MOOD_SAD:
+      leftW = rightW = 34;
+      leftH = rightH = 40;
+      break;
+    case MOOD_SUSPICIOUS:
+      leftW = rightW = 36;
+      leftH = 20;
+      rightH = 42;
+      break;
+  }
+
+  unsigned long now = millis();
+  leftEye.reset(18, 14, leftW, leftH, now);
+  rightEye.reset(74, 14, rightW, rightH, now);
+  rightEye.nextBlinkTime = leftEye.nextBlinkTime;
+  lastSaccade = now;
+  saccadeInterval = 3000;
+  breathStart = now;
+  breathVal = 0;
+}
+
+enum BuzzerDriveMode {
+  BUZZER_DRIVE_ACTIVE_HIGH,
+  BUZZER_DRIVE_ACTIVE_LOW,
+  BUZZER_DRIVE_PASSIVE
+};
+BuzzerDriveMode buzzerDriveMode = BUZZER_DRIVE_PASSIVE;
 
 // ==================================================
 // 2b. CONFIG PORTAL (WiFi + API Key + Telegram via local web)
@@ -186,6 +257,7 @@ WiFiClientSecure telegramClient;
 UniversalTelegramBot telegramBot("", telegramClient);
 
 void handleNotify();
+void beep(int duration = 150);
 
 void loadConfig() {
   prefs.begin("microbot", true);
@@ -338,27 +410,140 @@ void startConfigPortal() {
 // ==================================================
 // 3. LOGIC & NETWORK
 // ==================================================
+const char* displayModeName(DisplayMode mode) {
+  switch (mode) {
+    case MODE_FACE: return "MODE_FACE";
+    case MODE_CLOCK: return "MODE_CLOCK";
+    case MODE_WEATHER: return "MODE_WEATHER";
+    case MODE_FORECAST: return "MODE_FORECAST";
+    case MODE_WORLD: return "MODE_WORLD";
+  }
+  return "MODE_UNKNOWN";
+}
+
+const char* moodName(int mood) {
+  switch (mood) {
+    case MOOD_HAPPY: return "happy";
+    case MOOD_SAD: return "sad";
+    case MOOD_ANGRY: return "angry";
+    case MOOD_LOVE: return "love";
+    case MOOD_SLEEPY: return "sleepy";
+    case MOOD_EXCITED: return "excited";
+    case MOOD_SUSPICIOUS: return "suspicious";
+    case MOOD_SURPRISED: return "surprised";
+    case MOOD_NORMAL: return "normal";
+  }
+  return "unknown";
+}
+
+void wakeDisplayTask() {
+  if (displayTaskHandle != NULL) {
+    xTaskNotifyGive(displayTaskHandle);
+  }
+}
+
+void markDisplayChangedLocked(bool resetFace) {
+  displayRedrawRequested = true;
+  if (resetFace) faceResetRequested = true;
+  displayStateVersion++;
+}
+
+void requestCompleteRedraw(bool resetFace = false) {
+  portENTER_CRITICAL(&displayStateMux);
+  markDisplayChangedLocked(resetFace);
+  portEXIT_CRITICAL(&displayStateMux);
+  wakeDisplayTask();
+}
+
+void requestWeatherRefresh() {
+  portENTER_CRITICAL(&displayStateMux);
+  weatherRefreshRequested = true;
+  portEXIT_CRITICAL(&displayStateMux);
+  wakeDisplayTask();
+}
+
+bool takeWeatherRefreshRequest() {
+  portENTER_CRITICAL(&displayStateMux);
+  bool requested = weatherRefreshRequested;
+  weatherRefreshRequested = false;
+  portEXIT_CRITICAL(&displayStateMux);
+  return requested;
+}
+
+void detectBuzzerDriveMode() {
+  pinMode(BUZZER_PIN, INPUT_PULLUP);
+  delay(2);
+  int pullUpReading = digitalRead(BUZZER_PIN);
+
+  pinMode(BUZZER_PIN, INPUT_PULLDOWN);
+  delay(2);
+  int pullDownReading = digitalRead(BUZZER_PIN);
+
+  if (pullUpReading == pullDownReading) {
+    buzzerDriveMode = pullUpReading == HIGH
+      ? BUZZER_DRIVE_ACTIVE_LOW
+      : BUZZER_DRIVE_ACTIVE_HIGH;
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN,
+      buzzerDriveMode == BUZZER_DRIVE_ACTIVE_LOW ? HIGH : LOW);
+  } else {
+    buzzerDriveMode = BUZZER_DRIVE_PASSIVE;
+    pinMode(BUZZER_PIN, INPUT);
+  }
+
+  Serial.print("Buzzer detected: ");
+  if (buzzerDriveMode == BUZZER_DRIVE_ACTIVE_LOW) Serial.println("Active LOW");
+  else if (buzzerDriveMode == BUZZER_DRIVE_ACTIVE_HIGH) Serial.println("Active HIGH");
+  else Serial.println("Passive");
+}
+
+void beep(int duration) {
+  if (duration <= 0) return;
+  if (buzzerMutex != NULL) xSemaphoreTake(buzzerMutex, portMAX_DELAY);
+
+  if (buzzerDriveMode == BUZZER_DRIVE_PASSIVE) {
+    tone(BUZZER_PIN, 2000, duration);
+    delay(duration);
+    noTone(BUZZER_PIN);
+    pinMode(BUZZER_PIN, INPUT);
+  } else {
+    int onLevel = buzzerDriveMode == BUZZER_DRIVE_ACTIVE_LOW ? LOW : HIGH;
+    int offLevel = onLevel == LOW ? HIGH : LOW;
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, onLevel);
+    delay(duration);
+    digitalWrite(BUZZER_PIN, offLevel);
+  }
+
+  if (buzzerMutex != NULL) xSemaphoreGive(buzzerMutex);
+}
+
 void selectDisplayMode(DisplayMode mode) {
   portENTER_CRITICAL(&displayStateMux);
   currentMode = mode;
   if (notificationActive) previousMode = mode;
+  markDisplayChangedLocked(mode == MODE_FACE);
   portEXIT_CRITICAL(&displayStateMux);
+  Serial.print("Mode changed: ");
+  Serial.println(displayModeName(mode));
+  wakeDisplayTask();
 }
 
 void selectMood(int mood) {
   portENTER_CRITICAL(&displayStateMux);
   currentMood = mood;
+  manualMood = true;
   currentMode = MODE_FACE;
   if (notificationActive) previousMode = MODE_FACE;
-  lastSaccade = 0;
+  markDisplayChangedLocked(true);
   portEXIT_CRITICAL(&displayStateMux);
+  Serial.print("Mood changed: ");
+  Serial.println(moodName(mood));
+  Serial.println("Mode changed: MODE_FACE");
+  wakeDisplayTask();
 }
 
 void showNotification(const String& title, const String& message) {
-  digitalWrite(BUZZER_PIN, HIGH);
-  delay(200);
-  digitalWrite(BUZZER_PIN, LOW);
-
   if (notificationMutex != NULL) xSemaphoreTake(notificationMutex, portMAX_DELAY);
   notifTitle = title;
   notifMsg = message;
@@ -368,7 +553,11 @@ void showNotification(const String& title, const String& message) {
   previousMode = currentMode;
   notificationActive = true;
   notificationStart = millis();
+  markDisplayChangedLocked(false);
   portEXIT_CRITICAL(&displayStateMux);
+  Serial.println("Notification shown");
+  wakeDisplayTask();
+  beep();
 }
 
 void handleNotify() {
@@ -401,9 +590,24 @@ void updateMoodBasedOnWeather() {
   else if (weatherMain == "Clouds") m = MOOD_NORMAL;
   else if (temperature > 25) m = MOOD_EXCITED;
   else if (temperature < 5) m = MOOD_SLEEPY;
+
+  bool changed = false;
   portENTER_CRITICAL(&displayStateMux);
-  currentMood = m;
+  if (manualMood) {
+    portEXIT_CRITICAL(&displayStateMux);
+    return;
+  }
+  if (currentMood != m) {
+    currentMood = m;
+    changed = true;
+    markDisplayChangedLocked(currentMode == MODE_FACE);
+  }
   portEXIT_CRITICAL(&displayStateMux);
+  if (changed) {
+    Serial.print("Mood changed: ");
+    Serial.println(moodName(m));
+    wakeDisplayTask();
+  }
 }
 
 void handleTelegramMessages(int numNewMessages) {
@@ -419,6 +623,8 @@ void handleTelegramMessages(int numNewMessages) {
     if (mentionIndex >= 0) command = command.substring(0, mentionIndex);
     command.toLowerCase();
     arguments.trim();
+    Serial.print("Telegram command received: ");
+    Serial.println(command);
 
     if (command == "/start") {
       telegramBot.sendMessage(chatId,
@@ -440,9 +646,11 @@ void handleTelegramMessages(int numNewMessages) {
       telegramBot.sendMessage(chatId, String(TELEGRAM_OK) + "Clock screen opened.", "");
     } else if (command == "/weather") {
       selectDisplayMode(MODE_WEATHER);
+      requestWeatherRefresh();
       telegramBot.sendMessage(chatId, String(TELEGRAM_OK) + "Weather screen opened.", "");
     } else if (command == "/forecast") {
       selectDisplayMode(MODE_FORECAST);
+      requestWeatherRefresh();
       telegramBot.sendMessage(chatId, String(TELEGRAM_OK) + "Forecast screen opened.", "");
     } else if (command == "/world") {
       selectDisplayMode(MODE_WORLD);
@@ -507,19 +715,45 @@ void telegramTask(void* parameter) {
 
 void getWeatherAndForecast() {
   if (WiFi.status() != WL_CONNECTED) return;
+  bool weatherUpdated = false;
+  bool forecastUpdated = false;
   HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
   String url = "http://api.openweathermap.org/data/2.5/weather?q=" + city + "," + countryCode + "&appid=" + apiKey + "&units=metric";
   http.begin(url);
   if (http.GET() == 200) {
     String payload = http.getString();
     JSONVar myObject = JSON.parse(payload);
-    if (JSON.typeof(myObject) != "undefined") {
-      temperature = double(myObject["main"]["temp"]);
-      feelsLike = double(myObject["main"]["feels_like"]);
-      humidity = int(myObject["main"]["humidity"]);
-      weatherMain = (const char*)myObject["weather"][0]["main"];
-      weatherDesc = (const char*)myObject["weather"][0]["description"];
-      weatherDesc[0] = toupper(weatherDesc[0]);
+    bool validWeather = JSON.typeof(myObject) == "object"
+      && myObject.hasOwnProperty("main")
+      && myObject.hasOwnProperty("weather")
+      && JSON.typeof(myObject["main"]) == "object"
+      && myObject["main"].hasOwnProperty("temp")
+      && myObject["main"].hasOwnProperty("feels_like")
+      && myObject["main"].hasOwnProperty("humidity")
+      && JSON.typeof(myObject["weather"]) == "array"
+      && myObject["weather"].length() > 0
+      && JSON.typeof(myObject["weather"][0]) == "object"
+      && myObject["weather"][0].hasOwnProperty("main")
+      && myObject["weather"][0].hasOwnProperty("description");
+    if (validWeather) {
+      float updatedTemperature = double(myObject["main"]["temp"]);
+      float updatedFeelsLike = double(myObject["main"]["feels_like"]);
+      int updatedHumidity = int(myObject["main"]["humidity"]);
+      String updatedWeatherMain = (const char*)myObject["weather"][0]["main"];
+      String updatedWeatherDesc = (const char*)myObject["weather"][0]["description"];
+      if (!updatedWeatherDesc.isEmpty()) {
+        updatedWeatherDesc[0] = toupper(updatedWeatherDesc[0]);
+      }
+
+      temperature = updatedTemperature;
+      feelsLike = updatedFeelsLike;
+      humidity = updatedHumidity;
+      weatherMain = updatedWeatherMain;
+      weatherDesc = updatedWeatherDesc;
+      weatherDataAvailable = true;
+      weatherUpdated = true;
       updateMoodBasedOnWeather();
     }
   }
@@ -529,8 +763,12 @@ void getWeatherAndForecast() {
   if (http.GET() == 200) {
     String payload = http.getString();
     JSONVar fo = JSON.parse(payload);
-    if (JSON.typeof(fo) != "undefined") {
-      struct tm t;
+    bool validForecast = JSON.typeof(fo) == "object"
+      && fo.hasOwnProperty("list")
+      && JSON.typeof(fo["list"]) == "array"
+      && fo["list"].length() > 23;
+    if (validForecast) {
+      struct tm t = {};
       getLocalTime(&t);
       int today = t.tm_wday;
       const char* days[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
@@ -542,9 +780,13 @@ void getWeatherAndForecast() {
         int nextDayIndex = (today + i + 1) % 7;
         fcast[i].dayName = days[nextDayIndex];
       }
+      forecastDataAvailable = true;
+      forecastUpdated = true;
     }
   }
   http.end();
+  if (weatherUpdated) Serial.println("Weather updated successfully");
+  if (weatherUpdated || forecastUpdated) requestCompleteRedraw();
 }
 
 // ==================================================
@@ -588,7 +830,7 @@ void drawEyelidMask(float x, float y, float w, float h, int mood, bool isLeft) {
   }
 }
 
-void drawUltraProEye(Eye& e, bool isLeft) {
+void drawUltraProEye(Eye& e, bool isLeft, int mood) {
   int ix = (int)e.x;
   int iy = (int)e.y;
   int iw = (int)e.w;
@@ -627,19 +869,21 @@ void drawUltraProEye(Eye& e, bool isLeft) {
   }
 
   // 4. Apply Eyelid Masks (Expressions)
-  drawEyelidMask(e.x, e.y, e.w, e.h, currentMood, isLeft);
+  drawEyelidMask(e.x, e.y, e.w, e.h, mood, isLeft);
 }
 
-void updatePhysicsAndMood() {
+void updatePhysicsAndMood(int mood) {
   unsigned long now = millis();
-  breathVal = sin(now / 800.0) * 1.5;  // Breathing effect
+  breathVal = sin((now - breathStart) / 800.0) * 1.5;  // Breathing effect
 
   // --- BLINK LOGIC ---
   if (now > leftEye.nextBlinkTime) {
     leftEye.blinking = true;
     leftEye.lastBlink = now;
     rightEye.blinking = true;
+    rightEye.lastBlink = now;
     leftEye.nextBlinkTime = now + random(2000, 6000);
+    rightEye.nextBlinkTime = leftEye.nextBlinkTime;
   }
   if (leftEye.blinking) {
     leftEye.targetH = 2;
@@ -709,7 +953,7 @@ void updatePhysicsAndMood() {
     // Breathing effect applied to height
     baseH += breathVal;
 
-    switch (currentMood) {
+    switch (mood) {
       case MOOD_NORMAL:
         leftEye.targetW = baseW;
         leftEye.targetH = baseH;
@@ -718,6 +962,7 @@ void updatePhysicsAndMood() {
         break;
       case MOOD_HAPPY:
       case MOOD_LOVE:
+      case MOOD_EXCITED:
         leftEye.targetW = 40;
         leftEye.targetH = 32;
         rightEye.targetW = 40;
@@ -761,7 +1006,7 @@ void updatePhysicsAndMood() {
   leftEye.update();
   rightEye.update();
 
-  if(currentMood == MOOD_SUSPICIOUS){
+  if(mood == MOOD_SUSPICIOUS){
 
   float scan = sin(millis()*0.005)*10;
 
@@ -771,7 +1016,7 @@ void updatePhysicsAndMood() {
 }
 }
 
-void updateParticles() {
+void updateParticles(int mood) {
 
   for(int i=0;i<PARTICLE_COUNT;i++){
 
@@ -782,25 +1027,25 @@ void updateParticles() {
       particles[i].x = random(0,120);
     }
 
-    if(currentMood == MOOD_SAD){
+    if(mood == MOOD_SAD){
       display.drawBitmap(particles[i].x, particles[i].y, bmp_tiny_drop, 8, 8, SSD1306_WHITE);
     }
 
-    if(currentMood == MOOD_LOVE){
+    if(mood == MOOD_LOVE){
       display.drawBitmap(particles[i].x, particles[i].y, bmp_heart, 16, 16, SSD1306_WHITE);
     }
 
   }
 }
 
-void drawEmoPage() {
+void drawEmoPage(int mood) {
 
-  updatePhysicsAndMood();
+  updatePhysicsAndMood(mood);
 
-  updateParticles();
+  updateParticles(mood);
 
-  drawUltraProEye(leftEye, true);
-  drawUltraProEye(rightEye, false);
+  drawUltraProEye(leftEye, true, mood);
+  drawUltraProEye(rightEye, false, mood);
 }
 void drawNotification() {
   // Notification হেডার আঁকা
@@ -875,8 +1120,8 @@ void drawClock() {
   display.setCursor(114, 0);
   display.print(ampm);
   display.setFont(&FreeSansBold18pt7b);
-  char timeStr[6];
-  sprintf(timeStr, "%02d:%02d", h12, t.tm_min);
+  char timeStr[8];
+  snprintf(timeStr, sizeof(timeStr), "%02d:%02d", h12, t.tm_min);
   int16_t x1, y1;
   uint16_t w, h;
   display.getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
@@ -890,10 +1135,20 @@ void drawClock() {
   display.print(dateStr);
 }
 void drawWeatherCard() {
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
   if (WiFi.status() != WL_CONNECTED) {
     display.setFont(NULL);
     display.setCursor(0, 0);
-    display.print("No WiFi");
+    display.print("No WiFi\n\nWeather unavailable");
+    return;
+  }
+  if (!weatherDataAvailable) {
+    display.setFont(NULL);
+    display.setCursor(12, 24);
+    display.print("Loading weather...");
+    display.setCursor(30, 40);
+    display.print("Please wait");
     return;
   }
   display.drawBitmap(96, 0, getBigIcon(weatherMain), 32, 32, SSD1306_WHITE);
@@ -1003,18 +1258,17 @@ void setup() {
 Serial.begin(115200);
 Wire.begin(SDA_PIN, SCL_PIN);
 
-pinMode(BUZZER_PIN, OUTPUT);
-
-digitalWrite(BUZZER_PIN, LOW);
+displayTaskHandle = xTaskGetCurrentTaskHandle();
+notificationMutex = xSemaphoreCreateMutex();
+buzzerMutex = xSemaphoreCreateMutex();
+detectBuzzerDriveMode();
 display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.setTextColor(SSD1306_WHITE);
-  notificationMutex = xSemaphoreCreateMutex();
 
   loadConfig();
 
   // Init Eyes Center
-  leftEye.init(18, 14, 36, 36);
-  rightEye.init(74, 14, 36, 36);
+  resetEyeAnimationState(MOOD_NORMAL);
 
   playBootAnimation();
 
@@ -1089,48 +1343,88 @@ void loop() {
     return;
   }
   unsigned long now = millis();
-  if (now - lastWeatherUpdate > 600000) {
-    getWeatherAndForecast();
-    lastWeatherUpdate = now;
+  bool notificationClosed = false;
+  DisplayMode restoredMode = MODE_FACE;
+
+  portENTER_CRITICAL(&displayStateMux);
+  if (notificationActive && now - notificationStart > 5000) {
+    notificationActive = false;
+    currentMode = previousMode;
+    restoredMode = currentMode;
+    markDisplayChangedLocked(currentMode == MODE_FACE);
+    notificationClosed = true;
   }
+  portEXIT_CRITICAL(&displayStateMux);
+
+  if (notificationClosed) {
+    Serial.println("Notification closed");
+    Serial.print("Mode changed: ");
+    Serial.println(displayModeName(restoredMode));
+  }
+
+  bool showNotificationNow;
+  bool resetFaceNow;
+  bool forceRedrawNow;
+  DisplayMode modeToDraw;
+  int moodToDraw;
+  uint32_t stateVersionToDraw;
+
+  portENTER_CRITICAL(&displayStateMux);
+  showNotificationNow = notificationActive;
+  modeToDraw = currentMode;
+  moodToDraw = currentMood;
+  resetFaceNow = !showNotificationNow && modeToDraw == MODE_FACE && faceResetRequested;
+  if (resetFaceNow) faceResetRequested = false;
+  forceRedrawNow = displayRedrawRequested;
+  displayRedrawRequested = false;
+  stateVersionToDraw = displayStateVersion;
+  portEXIT_CRITICAL(&displayStateMux);
+
+  if (resetFaceNow) resetEyeAnimationState(moodToDraw);
 
   display.clearDisplay();
 
-  // ===== SHOW NOTIFICATION IF ACTIVE =====
-  bool showNotificationNow;
-  unsigned long activeNotificationStart;
-  portENTER_CRITICAL(&displayStateMux);
-  showNotificationNow = notificationActive;
-  activeNotificationStart = notificationStart;
-  portEXIT_CRITICAL(&displayStateMux);
-
   if (showNotificationNow) {
-
     drawNotification();
-
-    if (millis() - activeNotificationStart > 5000) {
-      portENTER_CRITICAL(&displayStateMux);
-      if (notificationActive && notificationStart == activeNotificationStart) {
-        notificationActive = false;
-        currentMode = previousMode;
-      }
-      portEXIT_CRITICAL(&displayStateMux);
-    }
-
   } else {
-    DisplayMode modeToDraw;
-    portENTER_CRITICAL(&displayStateMux);
-    modeToDraw = currentMode;
-    portEXIT_CRITICAL(&displayStateMux);
-
     switch (modeToDraw) {
-      case MODE_FACE: drawEmoPage(); break;
+      case MODE_FACE: drawEmoPage(moodToDraw); break;
       case MODE_CLOCK: drawClock(); break;
-      case MODE_WEATHER: drawWeatherCard(); break;
+      case MODE_WEATHER:
+        if (forceRedrawNow) Serial.println("drawWeatherCard() called");
+        drawWeatherCard();
+        break;
       case MODE_FORECAST: drawForecastPage(); break;
       case MODE_WORLD: drawWorldClock(); break;
     }
   }
-  display.display();
-  delay(15);
+
+  portENTER_CRITICAL(&displayStateMux);
+  bool stateChangedWhileDrawing = displayStateVersion != stateVersionToDraw;
+  portEXIT_CRITICAL(&displayStateMux);
+
+  if (!stateChangedWhileDrawing) {
+    display.display();
+  } else {
+    ulTaskNotifyTake(pdTRUE, 0);
+    return;
+  }
+
+  if (showNotificationNow) {
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(15));
+    return;
+  }
+
+  if (ulTaskNotifyTake(pdTRUE, 0) > 0) {
+    return;
+  }
+
+  bool refreshWeatherNow = takeWeatherRefreshRequest();
+  now = millis();
+  if (refreshWeatherNow || now - lastWeatherUpdate > 600000) {
+    getWeatherAndForecast();
+    lastWeatherUpdate = millis();
+  }
+
+  ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(15));
 }
