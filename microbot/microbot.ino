@@ -798,35 +798,47 @@ void drawEyelidMask(float x, float y, float w, float h, int mood, bool isLeft) {
   int iy = (int)y;
   int iw = (int)w;
   int ih = (int)h;
-  display.setTextColor(SSD1306_BLACK);
+  if (iw < 4 || ih < 4) return;
 
-  // ANGRY: Sharp slanted cut
+  int right = ix + iw - 1;
+  int bottom = iy + ih - 1;
+  int lidDepth = ih / 5;
+  if (lidDepth < 2) lidDepth = 2;
+  if (lidDepth > 6) lidDepth = 6;
+  if (lidDepth >= ih) lidDepth = ih - 1;
+
+  // Keep expression masks shallow and entirely inside the eye bounds.
   if (mood == MOOD_ANGRY) {
-    if (isLeft)
-      for (int i = 0; i < 16; i++) display.drawLine(ix, iy + i, ix + iw, iy - 6 + i, SSD1306_BLACK);
-    else
-      for (int i = 0; i < 16; i++) display.drawLine(ix, iy - 6 + i, ix + iw, iy + i, SSD1306_BLACK);
+    if (isLeft) {
+      display.fillTriangle(ix, iy, right, iy, right, iy + lidDepth, SSD1306_BLACK);
+    } else {
+      display.fillTriangle(ix, iy, right, iy, ix, iy + lidDepth, SSD1306_BLACK);
+    }
   }
-  // SAD: Inverse slanted cut
   else if (mood == MOOD_SAD) {
-    if (isLeft)
-      for (int i = 0; i < 16; i++) display.drawLine(ix, iy - 6 + i, ix + iw, iy + i, SSD1306_BLACK);
-    else
-      for (int i = 0; i < 16; i++) display.drawLine(ix, iy + i, ix + iw, iy - 6 + i, SSD1306_BLACK);
+    if (isLeft) {
+      display.fillTriangle(ix, iy, right, iy, ix, iy + lidDepth, SSD1306_BLACK);
+    } else {
+      display.fillTriangle(ix, iy, right, iy, right, iy + lidDepth, SSD1306_BLACK);
+    }
   }
-  // HAPPY/LOVE: Cheek push up
   else if (mood == MOOD_HAPPY || mood == MOOD_LOVE || mood == MOOD_EXCITED) {
-    display.fillRect(ix, iy + ih - 12, iw, 14, SSD1306_BLACK);
-    display.fillCircle(ix + iw / 2, iy + ih + 6, iw / 1.3, SSD1306_BLACK);  // Round cut
+    display.fillTriangle(
+      ix, bottom,
+      right, bottom,
+      ix + iw / 2, bottom - lidDepth,
+      SSD1306_BLACK);
   }
-  // SLEEPY: Heavy lids
   else if (mood == MOOD_SLEEPY) {
-    display.fillRect(ix, iy, iw, ih / 2 + 2, SSD1306_BLACK);
+    display.fillRect(ix, iy, iw, lidDepth, SSD1306_BLACK);
   }
-  // SUSPICIOUS: One eye squint, one open
   else if (mood == MOOD_SUSPICIOUS) {
-    if (isLeft) display.fillRect(ix, iy, iw, ih / 2 - 2, SSD1306_BLACK);
-    else display.fillRect(ix, iy + ih - 8, iw, 8, SSD1306_BLACK);
+    if (isLeft) {
+      display.fillRect(ix, iy, iw, lidDepth, SSD1306_BLACK);
+    } else {
+      int lowerLidDepth = lidDepth > 2 ? 2 : lidDepth;
+      display.fillRect(ix, bottom - lowerLidDepth + 1, iw, lowerLidDepth, SSD1306_BLACK);
+    }
   }
 }
 
@@ -835,11 +847,15 @@ void drawUltraProEye(Eye& e, bool isLeft, int mood) {
   int iy = (int)e.y;
   int iw = (int)e.w;
   int ih = (int)e.h;
+  if (iw <= 0 || ih <= 0) return;
 
   // 1. Draw Sclera (White base)
-  int r = 8;
-  if (iw < 20) r = 3;
-  display.fillRoundRect(ix, iy, iw, ih, r, SSD1306_WHITE);
+  int r = min(8, min(iw, ih) / 2);
+  if (r > 0) {
+    display.fillRoundRect(ix, iy, iw, ih, r, SSD1306_WHITE);
+  } else {
+    display.fillRect(ix, iy, iw, ih, SSD1306_WHITE);
+  }
 
   // 2. Draw Pupil (Black inner eye) - Constrained to be inside
   // Calculate center of eye
@@ -847,8 +863,10 @@ void drawUltraProEye(Eye& e, bool isLeft, int mood) {
   int cy = iy + ih / 2;
 
   // Pupil size is proportional to eye size
-  int pw = iw / 2.2;
-  int ph = ih / 2.2;
+  int pw = max(1, (int)(iw / 2.2f));
+  int ph = max(1, (int)(ih / 2.2f));
+  if (pw > iw) pw = iw;
+  if (ph > ih) ph = ih;
 
   // Apply pupil offset (Gaze)
   int px = cx + (int)e.pupilX - (pw / 2);
@@ -860,7 +878,12 @@ void drawUltraProEye(Eye& e, bool isLeft, int mood) {
   if (py < iy) py = iy;
   if (py + ph > iy + ih) py = iy + ih - ph;
 
-  display.fillRoundRect(px, py, pw, ph, r / 2, SSD1306_BLACK);
+  int pupilRadius = min(r / 2, min(pw, ph) / 2);
+  if (pupilRadius > 0) {
+    display.fillRoundRect(px, py, pw, ph, pupilRadius, SSD1306_BLACK);
+  } else {
+    display.fillRect(px, py, pw, ph, SSD1306_BLACK);
+  }
 
   // 3. Draw Specular Highlight (The "Glint" of life)
   // A tiny white dot in the top-right of the pupil
