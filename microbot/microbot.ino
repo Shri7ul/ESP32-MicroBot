@@ -5,10 +5,13 @@
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <Arduino_JSON.h>
+#include <ArduinoJson.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "time.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
 #include <math.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSansBold9pt7b.h>
@@ -23,6 +26,16 @@
 #define SDA_PIN 8
 #define SCL_PIN 9
 #define BUZZER_PIN 4
+
+#ifndef MICROBOT_AI_API_URL
+#define MICROBOT_AI_API_URL ""
+#endif
+#ifndef MICROBOT_AI_API_KEY
+#define MICROBOT_AI_API_KEY ""
+#endif
+#ifndef MICROBOT_AI_MODEL
+#define MICROBOT_AI_MODEL ""
+#endif
 
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
@@ -60,11 +73,64 @@ String notifMsg = "";
 portMUX_TYPE displayStateMux = portMUX_INITIALIZER_UNLOCKED;
 SemaphoreHandle_t notificationMutex;
 SemaphoreHandle_t buzzerMutex;
+SemaphoreHandle_t reminderMutex;
+SemaphoreHandle_t aiStatusMutex;
+SemaphoreHandle_t telegramMutex;
 TaskHandle_t displayTaskHandle = NULL;
 bool faceResetRequested = true;
 bool displayRedrawRequested = true;
 bool weatherRefreshRequested = false;
 uint32_t displayStateVersion = 0;
+
+#define MAX_REMINDERS 10
+#define REMINDER_TITLE_LENGTH 96
+#define REMINDER_CHAT_LENGTH 48
+#define AI_STATUS_LENGTH 24
+#define AI_PROMPT_LENGTH 512
+#define AI_REQUEST_BODY_LENGTH 1024
+#define AI_RESPONSE_JSON_LENGTH 6144
+#define AI_ANSWER_LENGTH 3072
+#define AI_TASK_STACK_SIZE 24576
+#define TELEGRAM_TASK_STACK_SIZE 16384
+#define IDLE_INACTIVITY_MS 180000UL
+
+struct Reminder {
+  bool active;
+  uint8_t id;
+  unsigned long dueAt;
+  char title[REMINDER_TITLE_LENGTH];
+  char chatId[REMINDER_CHAT_LENGTH];
+};
+
+struct ReminderTelegramNotice {
+  char chatId[REMINDER_CHAT_LENGTH];
+  char title[REMINDER_TITLE_LENGTH];
+};
+
+Reminder reminders[MAX_REMINDERS];
+uint8_t nextReminderId = 1;
+QueueHandle_t reminderNoticeQueue = NULL;
+QueueHandle_t reminderPopupQueue = NULL;
+
+bool aiThinking = false;
+char aiStatus[AI_STATUS_LENGTH] = "";
+unsigned long aiStatusUntil = 0;
+
+struct AIRequest {
+  char chatId[REMINDER_CHAT_LENGTH];
+  char prompt[AI_PROMPT_LENGTH];
+};
+
+QueueHandle_t aiRequestQueue = NULL;
+TaskHandle_t aiTaskHandle = NULL;
+portMUX_TYPE aiRequestMux = portMUX_INITIALIZER_UNLOCKED;
+bool aiRequestBusy = false;
+HTTPClient aiHttpClient;
+JsonDocument aiJsonDocument;
+char aiRequestBody[AI_REQUEST_BODY_LENGTH];
+char aiResponseJson[AI_RESPONSE_JSON_LENGTH];
+char aiAnswer[AI_ANSWER_LENGTH];
+long lastProcessedTelegramUpdate = 0;
 
 #define PARTICLE_COUNT 6
 
@@ -86,8 +152,43 @@ Particle particles[PARTICLE_COUNT];
 #define MOOD_EXCITED 6
 #define MOOD_LOVE 7
 #define MOOD_SUSPICIOUS 8
+#define MOOD_CRY 9
+#define MOOD_WINK 10
+#define MOOD_LAUGH 11
+#define MOOD_SHOCK 12
+#define MOOD_EVIL 13
+#define MOOD_TIRED 14
+#define MOOD_FOCUS 15
+#define MOOD_CONFUSED 16
+#define MOOD_COOL 17
 int currentMood = MOOD_NORMAL;
 bool manualMood = false;
+
+enum IdleAction {
+  IDLE_NONE,
+  IDLE_LOOK_LEFT,
+  IDLE_LOOK_RIGHT,
+  IDLE_LOOK_UP,
+  IDLE_LOOK_DOWN,
+  IDLE_BLINK,
+  IDLE_DOUBLE_BLINK,
+  IDLE_LONG_BLINK,
+  IDLE_SLEEPY_BLINK,
+  IDLE_STRETCH,
+  IDLE_YAWN,
+  IDLE_SLEEP,
+  IDLE_WAKE,
+  IDLE_SCAN,
+  IDLE_ZZZ
+};
+
+IdleAction idleAction = IDLE_NONE;
+unsigned long idleActionStarted = 0;
+unsigned long idleActionUntil = 0;
+unsigned long idleNextActionAt = 0;
+uint8_t idleBlinkCount = 0;
+bool idleResetRequested = false;
+unsigned long lastUserActivity = 0;
 
 String city;         // Loaded from Preferences
 String countryCode;  // Loaded from Preferences
@@ -95,6 +196,9 @@ String apiKey;       // Loaded from Preferences or defaults
 String wifiSsid;     // Loaded from Preferences
 String wifiPass;     // Loaded from Preferences
 String telegramBotToken;  // Loaded from Preferences
+String aiApiUrl;
+String aiApiKey;
+String aiModel;
 unsigned long lastWeatherUpdate = 0;
 float temperature = 0.0;
 float feelsLike = 0.0;
@@ -224,6 +328,44 @@ void resetEyeAnimationState(int mood) {
       leftH = 20;
       rightH = 42;
       break;
+    case MOOD_CRY:
+      leftW = rightW = 34;
+      leftH = rightH = 38;
+      break;
+    case MOOD_WINK:
+      leftW = rightW = 36;
+      leftH = rightH = 36;
+      break;
+    case MOOD_LAUGH:
+      leftW = rightW = 40;
+      leftH = rightH = 30;
+      break;
+    case MOOD_SHOCK:
+      leftW = rightW = 28;
+      leftH = rightH = 46;
+      break;
+    case MOOD_EVIL:
+      leftW = rightW = 36;
+      leftH = rightH = 30;
+      break;
+    case MOOD_TIRED:
+      leftW = rightW = 38;
+      leftH = rightH = 24;
+      break;
+    case MOOD_FOCUS:
+      leftW = rightW = 32;
+      leftH = rightH = 28;
+      break;
+    case MOOD_CONFUSED:
+      leftW = 34;
+      leftH = 38;
+      rightW = 38;
+      rightH = 30;
+      break;
+    case MOOD_COOL:
+      leftW = rightW = 36;
+      leftH = rightH = 34;
+      break;
   }
 
   unsigned long now = millis();
@@ -242,6 +384,9 @@ enum BuzzerDriveMode {
   BUZZER_DRIVE_PASSIVE
 };
 BuzzerDriveMode buzzerDriveMode = BUZZER_DRIVE_PASSIVE;
+bool buzzerPulseActive = false;
+bool buzzerPulsePassive = false;
+unsigned long buzzerPulseEndsAt = 0;
 
 // ==================================================
 // 2b. CONFIG PORTAL (WiFi + API Key + Telegram via local web)
@@ -254,10 +399,13 @@ WebServer configServer(80);
 bool inConfigMode = false;
 bool configRoutesRegistered = false;
 WiFiClientSecure telegramClient;
+WiFiClientSecure aiClient;
 UniversalTelegramBot telegramBot("", telegramClient);
 
 void handleNotify();
 void beep(int duration = 150);
+String askAI(String prompt);
+void noteUserActivity();
 
 void loadConfig() {
   prefs.begin("microbot", true);
@@ -268,6 +416,9 @@ void loadConfig() {
   countryCode = prefs.getString("country", "");
   tzString = prefs.getString("tz", "");
   telegramBotToken = prefs.getString("bottoken", "");
+  aiApiUrl = prefs.getString("aiurl", MICROBOT_AI_API_URL);
+  aiApiKey = prefs.getString("aikey", MICROBOT_AI_API_KEY);
+  aiModel = prefs.getString("aimodel", MICROBOT_AI_MODEL);
   prefs.end();
   if (wifiSsid.isEmpty()) {
     wifiSsid = "asdggrgf)"; //local Wifi name
@@ -288,7 +439,8 @@ void loadConfig() {
 
 void saveConfig(const String& s, const String& p, const String& ak,
                 const String& cty, const String& ctry, const String& tz,
-                const String& botToken) {
+                const String& botToken, const String& aiUrl,
+                const String& aiKey, const String& aiModelName) {
   prefs.begin("microbot", false);
   prefs.putString("ssid", s);
   prefs.putString("pass", p);
@@ -297,6 +449,9 @@ void saveConfig(const String& s, const String& p, const String& ak,
   prefs.putString("country", ctry);
   prefs.putString("tz", tz);
   prefs.putString("bottoken", botToken);
+  prefs.putString("aiurl", aiUrl);
+  prefs.putString("aikey", aiKey);
+  prefs.putString("aimodel", aiModelName);
   prefs.end();
 }
 
@@ -308,6 +463,9 @@ void handleConfigRoot() {
   String sCtry = prefs.getString("country", "IN");
   String sTz = prefs.getString("tz", "IST-5:30");
   String sBotToken = prefs.getString("bottoken", "");
+  String sAiUrl = prefs.getString("aiurl", MICROBOT_AI_API_URL);
+  String sAiKey = prefs.getString("aikey", MICROBOT_AI_API_KEY);
+  String sAiModel = prefs.getString("aimodel", MICROBOT_AI_MODEL);
   prefs.end();
 
   String html = R"rawliteral(
@@ -351,6 +509,17 @@ label{display:block;margin-top:14px;color:#8ab4e8;font-size:14px;}
   html += sBotToken;
   html += R"rawliteral(">
 </div>
+<div class="section"><div class="section-title">AI (OpenAI-compatible API)</div>
+<label>Endpoint URL</label><input name="aiurl" placeholder="https://provider.example/v1/chat/completions" value=")rawliteral";
+  html += sAiUrl;
+  html += R"rawliteral(">
+<label>API Key</label><input name="aikey" type="password" placeholder="Provider API key" value=")rawliteral";
+  html += sAiKey;
+  html += R"rawliteral(">
+<label>Model</label><input name="aimodel" placeholder="Provider model name" value=")rawliteral";
+  html += sAiModel;
+  html += R"rawliteral(">
+</div>
 <button type="submit">Save &amp; Reboot</button>
 </form></body></html>)rawliteral";
   configServer.send(200, "text/html", html);
@@ -368,6 +537,9 @@ void handleConfigSave() {
   String ctr = configServer.arg("country");
   String tz = configServer.arg("tz");
   String botToken = configServer.arg("bottoken");
+  String aiUrl = configServer.arg("aiurl");
+  String aiKey = configServer.arg("aikey");
+  String aiModelName = configServer.arg("aimodel");
   prefs.begin("microbot", true);
   if (p.isEmpty()) p = prefs.getString("pass", "");
   if (ak.isEmpty()) ak = prefs.getString("apikey", "45fcf5807a5920e2006c2b8a077d423f");
@@ -375,8 +547,11 @@ void handleConfigSave() {
   if (ctr.isEmpty()) ctr = prefs.getString("country", "IN");
   if (tz.isEmpty()) tz = prefs.getString("tz", "IST-5:30");
   if (botToken.isEmpty()) botToken = prefs.getString("bottoken", "");
+  if (aiUrl.isEmpty()) aiUrl = prefs.getString("aiurl", MICROBOT_AI_API_URL);
+  if (aiKey.isEmpty()) aiKey = prefs.getString("aikey", MICROBOT_AI_API_KEY);
+  if (aiModelName.isEmpty()) aiModelName = prefs.getString("aimodel", MICROBOT_AI_MODEL);
   prefs.end();
-  saveConfig(s, p, ak, cty, ctr, tz, botToken);
+  saveConfig(s, p, ak, cty, ctr, tz, botToken, aiUrl, aiKey, aiModelName);
   configServer.send(200, "text/html",
                     "<html><body style='font-family:sans-serif;background:#0c1929;color:#e8f4fc;padding:40px;'>"
                     "<h2 style='color:#5ba3f5'>Saved!</h2><p>Rebooting in 2 seconds...</p></body></html>");
@@ -431,6 +606,15 @@ const char* moodName(int mood) {
     case MOOD_EXCITED: return "excited";
     case MOOD_SUSPICIOUS: return "suspicious";
     case MOOD_SURPRISED: return "surprised";
+    case MOOD_CRY: return "cry";
+    case MOOD_WINK: return "wink";
+    case MOOD_LAUGH: return "laugh";
+    case MOOD_SHOCK: return "shock";
+    case MOOD_EVIL: return "evil";
+    case MOOD_TIRED: return "tired";
+    case MOOD_FOCUS: return "focus";
+    case MOOD_CONFUSED: return "confused";
+    case MOOD_COOL: return "cool";
     case MOOD_NORMAL: return "normal";
   }
   return "unknown";
@@ -501,20 +685,37 @@ void beep(int duration) {
   if (duration <= 0) return;
   if (buzzerMutex != NULL) xSemaphoreTake(buzzerMutex, portMAX_DELAY);
 
-  if (buzzerDriveMode == BUZZER_DRIVE_PASSIVE) {
-    tone(BUZZER_PIN, 2000, duration);
-    delay(duration);
+  if (buzzerPulseActive && buzzerPulsePassive) {
     noTone(BUZZER_PIN);
-    pinMode(BUZZER_PIN, INPUT);
-  } else {
-    int onLevel = buzzerDriveMode == BUZZER_DRIVE_ACTIVE_LOW ? LOW : HIGH;
-    int offLevel = onLevel == LOW ? HIGH : LOW;
-    pinMode(BUZZER_PIN, OUTPUT);
-    digitalWrite(BUZZER_PIN, onLevel);
-    delay(duration);
-    digitalWrite(BUZZER_PIN, offLevel);
   }
 
+  if (buzzerDriveMode == BUZZER_DRIVE_PASSIVE) {
+    tone(BUZZER_PIN, 2000, duration);
+    buzzerPulsePassive = true;
+  } else {
+    int onLevel = buzzerDriveMode == BUZZER_DRIVE_ACTIVE_LOW ? LOW : HIGH;
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, onLevel);
+    buzzerPulsePassive = false;
+  }
+  buzzerPulseEndsAt = millis() + duration;
+  buzzerPulseActive = true;
+
+  if (buzzerMutex != NULL) xSemaphoreGive(buzzerMutex);
+}
+
+void updateBuzzer() {
+  if (buzzerMutex != NULL) xSemaphoreTake(buzzerMutex, portMAX_DELAY);
+  if (buzzerPulseActive && (long)(millis() - buzzerPulseEndsAt) >= 0) {
+    if (buzzerPulsePassive) {
+      noTone(BUZZER_PIN);
+      pinMode(BUZZER_PIN, INPUT);
+    } else {
+      int offLevel = buzzerDriveMode == BUZZER_DRIVE_ACTIVE_LOW ? HIGH : LOW;
+      digitalWrite(BUZZER_PIN, offLevel);
+    }
+    buzzerPulseActive = false;
+  }
   if (buzzerMutex != NULL) xSemaphoreGive(buzzerMutex);
 }
 
@@ -610,11 +811,316 @@ void updateMoodBasedOnWeather() {
   }
 }
 
+void noteUserActivity() {
+  unsigned long now = millis();
+  portENTER_CRITICAL(&displayStateMux);
+  lastUserActivity = now;
+  idleResetRequested = true;
+  markDisplayChangedLocked(false);
+  portEXIT_CRITICAL(&displayStateMux);
+  wakeDisplayTask();
+}
+
+void setAIStatus(bool thinking, const char* status, unsigned long visibleForMs = 0) {
+  if (aiStatusMutex != NULL) xSemaphoreTake(aiStatusMutex, portMAX_DELAY);
+  aiThinking = thinking;
+  snprintf(aiStatus, sizeof(aiStatus), "%s", status);
+  aiStatusUntil = thinking ? 0 : millis() + visibleForMs;
+  if (aiStatusMutex != NULL) xSemaphoreGive(aiStatusMutex);
+  requestCompleteRedraw(false);
+}
+
+bool getAIStatusSnapshot(unsigned long now, bool& thinking, char* status, size_t statusLength) {
+  if (aiStatusMutex != NULL) xSemaphoreTake(aiStatusMutex, portMAX_DELAY);
+  if (!aiThinking && aiStatus[0] != '\0'
+      && (long)(now - aiStatusUntil) >= 0) {
+    aiStatus[0] = '\0';
+  }
+  thinking = aiThinking;
+  snprintf(status, statusLength, "%s", aiStatus);
+  bool active = thinking || status[0] != '\0';
+  if (aiStatusMutex != NULL) xSemaphoreGive(aiStatusMutex);
+  return active;
+}
+
+bool parseReminderArguments(const String& arguments, String& title,
+                            unsigned long& durationMs) {
+  int lastSpace = arguments.lastIndexOf(' ');
+  if (lastSpace <= 0) return false;
+
+  title = arguments.substring(0, lastSpace);
+  String durationText = arguments.substring(lastSpace + 1);
+  title.trim();
+  durationText.trim();
+  if (title.isEmpty() || title.length() >= REMINDER_TITLE_LENGTH
+      || durationText.length() < 2) {
+    return false;
+  }
+
+  char unit = tolower(durationText[durationText.length() - 1]);
+  if (unit != 'm' && unit != 'h') return false;
+
+  String amountText = durationText.substring(0, durationText.length() - 1);
+  for (unsigned int i = 0; i < amountText.length(); i++) {
+    if (!isDigit(amountText[i])) return false;
+  }
+
+  unsigned long amount = strtoul(amountText.c_str(), NULL, 10);
+  if (amount == 0) return false;
+
+  uint64_t multiplier = unit == 'h' ? 3600000ULL : 60000ULL;
+  uint64_t requestedDuration = (uint64_t)amount * multiplier;
+  if (requestedDuration > 0x7FFFFFFFULL) return false;
+
+  durationMs = (unsigned long)requestedDuration;
+  return true;
+}
+
+bool reminderIdInUse(uint8_t id) {
+  for (int i = 0; i < MAX_REMINDERS; i++) {
+    if (reminders[i].active && reminders[i].id == id) return true;
+  }
+  return false;
+}
+
+int createReminder(const String& title, const String& chatId,
+                   unsigned long durationMs) {
+  if (reminderMutex != NULL) xSemaphoreTake(reminderMutex, portMAX_DELAY);
+
+  int freeIndex = -1;
+  for (int i = 0; i < MAX_REMINDERS; i++) {
+    if (!reminders[i].active) {
+      freeIndex = i;
+      break;
+    }
+  }
+
+  uint8_t reminderId = 0;
+  if (freeIndex >= 0) {
+    for (int attempt = 0; attempt < 255; attempt++) {
+      reminderId = nextReminderId++;
+      if (nextReminderId == 0) nextReminderId = 1;
+      if (reminderId != 0 && !reminderIdInUse(reminderId)) break;
+      reminderId = 0;
+    }
+  }
+
+  if (freeIndex >= 0 && reminderId != 0) {
+    Reminder& reminder = reminders[freeIndex];
+    reminder.active = true;
+    reminder.id = reminderId;
+    reminder.dueAt = millis() + durationMs;
+    title.toCharArray(reminder.title, sizeof(reminder.title));
+    chatId.toCharArray(reminder.chatId, sizeof(reminder.chatId));
+  }
+
+  if (reminderMutex != NULL) xSemaphoreGive(reminderMutex);
+  return freeIndex >= 0 && reminderId != 0 ? reminderId : -1;
+}
+
+bool cancelReminder(uint8_t id) {
+  bool cancelled = false;
+  if (reminderMutex != NULL) xSemaphoreTake(reminderMutex, portMAX_DELAY);
+  for (int i = 0; i < MAX_REMINDERS; i++) {
+    if (reminders[i].active && reminders[i].id == id) {
+      reminders[i].active = false;
+      cancelled = true;
+      break;
+    }
+  }
+  if (reminderMutex != NULL) xSemaphoreGive(reminderMutex);
+  return cancelled;
+}
+
+String formatRemainingTime(unsigned long remainingMs) {
+  unsigned long totalMinutes = (remainingMs + 59999UL) / 60000UL;
+  if (totalMinutes == 0) return "<1m";
+  if (totalMinutes < 60) return String(totalMinutes) + "m";
+
+  unsigned long hours = totalMinutes / 60;
+  unsigned long minutes = totalMinutes % 60;
+  if (minutes == 0) return String(hours) + "h";
+  return String(hours) + "h " + String(minutes) + "m";
+}
+
+String listReminders() {
+  String result = "Active reminders:";
+  int count = 0;
+  unsigned long now = millis();
+
+  if (reminderMutex != NULL) xSemaphoreTake(reminderMutex, portMAX_DELAY);
+  for (int i = 0; i < MAX_REMINDERS; i++) {
+    if (!reminders[i].active) continue;
+    unsigned long remaining = (long)(reminders[i].dueAt - now) > 0
+      ? reminders[i].dueAt - now
+      : 0;
+    result += "\n";
+    result += reminders[i].id;
+    result += ". ";
+    result += reminders[i].title;
+    result += " (";
+    result += formatRemainingTime(remaining);
+    result += ")";
+    count++;
+  }
+  if (reminderMutex != NULL) xSemaphoreGive(reminderMutex);
+
+  return count == 0 ? "No active reminders." : result;
+}
+
+void checkReminders(unsigned long now) {
+  static unsigned long lastReminderCheck = 0;
+  if (now - lastReminderCheck < 250) return;
+  lastReminderCheck = now;
+
+  ReminderTelegramNotice expired[MAX_REMINDERS];
+  int expiredCount = 0;
+
+  if (reminderMutex != NULL) xSemaphoreTake(reminderMutex, portMAX_DELAY);
+  for (int i = 0; i < MAX_REMINDERS; i++) {
+    if (!reminders[i].active
+        || (long)(now - reminders[i].dueAt) < 0) {
+      continue;
+    }
+
+    snprintf(expired[expiredCount].chatId,
+             sizeof(expired[expiredCount].chatId), "%s", reminders[i].chatId);
+    snprintf(expired[expiredCount].title,
+             sizeof(expired[expiredCount].title), "%s", reminders[i].title);
+    reminders[i].active = false;
+    expiredCount++;
+  }
+  if (reminderMutex != NULL) xSemaphoreGive(reminderMutex);
+
+  for (int i = 0; i < expiredCount; i++) {
+    if (reminderNoticeQueue != NULL
+        && xQueueSend(reminderNoticeQueue, &expired[i], 0) != pdTRUE) {
+      Serial.println("Reminder Telegram queue full");
+    }
+    if (reminderPopupQueue != NULL
+        && xQueueSend(reminderPopupQueue, &expired[i], 0) != pdTRUE) {
+      Serial.println("Reminder popup queue full");
+    }
+  }
+}
+
+void showNextReminderPopup() {
+  bool notificationShowing;
+  portENTER_CRITICAL(&displayStateMux);
+  notificationShowing = notificationActive;
+  portEXIT_CRITICAL(&displayStateMux);
+  if (notificationShowing || reminderPopupQueue == NULL) return;
+
+  ReminderTelegramNotice reminderNotice;
+  if (xQueueReceive(reminderPopupQueue, &reminderNotice, 0) == pdTRUE) {
+    showNotification("Reminder", reminderNotice.title);
+  }
+}
+
+void sendPendingReminderNotices() {
+  if (reminderNoticeQueue == NULL) return;
+
+  ReminderTelegramNotice reminderNotice;
+  while (xQueueReceive(reminderNoticeQueue, &reminderNotice, 0) == pdTRUE) {
+    String message = "Reminder:\n";
+    message += reminderNotice.title;
+    if (!telegramBot.sendMessage(reminderNotice.chatId, message, "")) {
+      xQueueSendToFront(reminderNoticeQueue, &reminderNotice, 0);
+      break;
+    }
+  }
+}
+
+bool sendTelegramLongMessage(const String& chatId, const String& message) {
+  const unsigned int chunkSize = 1200;
+  unsigned int start = 0;
+  bool sentAll = true;
+
+  while (start < message.length()) {
+    unsigned int end = min(start + chunkSize, message.length());
+    while (end < message.length() && end > start
+           && (((uint8_t)message[end] & 0xC0) == 0x80)) {
+      end--;
+    }
+    if (end == start) end = min(start + chunkSize, message.length());
+    if (!telegramBot.sendMessage(chatId, message.substring(start, end), "")) {
+      sentAll = false;
+      break;
+    }
+    start = end;
+  }
+  return sentAll;
+}
+
+String askAI(String prompt) {
+  if (WiFi.status() != WL_CONNECTED || aiApiUrl.isEmpty()
+      || aiModel.isEmpty()) {
+    return "";
+  }
+
+  HTTPClient http;
+  http.setConnectTimeout(8000);
+  http.setTimeout(20000);
+
+  bool started = false;
+  if (aiApiUrl.startsWith("https://")) {
+    aiClient.setInsecure();
+    started = http.begin(aiClient, aiApiUrl);
+  } else {
+    started = http.begin(aiApiUrl);
+  }
+  if (!started) return "";
+
+  http.addHeader("Content-Type", "application/json");
+  if (!aiApiKey.isEmpty()) {
+    http.addHeader("Authorization", "Bearer " + aiApiKey);
+  }
+
+  JSONVar message;
+  message["role"] = "user";
+  message["content"] = prompt;
+  JSONVar messages;
+  messages[0] = message;
+  JSONVar request;
+  request["model"] = aiModel;
+  request["messages"] = messages;
+
+  int httpCode = http.POST(JSON.stringify(request));
+  if (httpCode < 200 || httpCode >= 300) {
+    Serial.print("AI request failed, HTTP ");
+    Serial.println(httpCode);
+    http.end();
+    return "";
+  }
+
+  String payload = http.getString();
+  http.end();
+  JSONVar response = JSON.parse(payload);
+  bool validResponse = JSON.typeof(response) == "object"
+    && response.hasOwnProperty("choices")
+    && JSON.typeof(response["choices"]) == "array"
+    && response["choices"].length() > 0
+    && JSON.typeof(response["choices"][0]) == "object"
+    && response["choices"][0].hasOwnProperty("message")
+    && JSON.typeof(response["choices"][0]["message"]) == "object"
+    && response["choices"][0]["message"].hasOwnProperty("content")
+    && JSON.typeof(response["choices"][0]["message"]["content"]) == "string";
+  if (!validResponse) {
+    Serial.println("AI response format was not OpenAI-compatible");
+    return "";
+  }
+
+  String answer = (const char*)response["choices"][0]["message"]["content"];
+  answer.trim();
+  return answer;
+}
+
 void handleTelegramMessages(int numNewMessages) {
   for (int i = 0; i < numNewMessages; i++) {
     String chatId = telegramBot.messages[i].chat_id;
     String text = telegramBot.messages[i].text;
     text.trim();
+    noteUserActivity();
 
     int firstSpace = text.indexOf(' ');
     String command = firstSpace >= 0 ? text.substring(0, firstSpace) : text;
@@ -635,8 +1141,13 @@ void handleTelegramMessages(int numNewMessages) {
         "/forecast - Display forecast\n"
         "/world - Display world clock\n"
         "/notify <title> | <message> - Show an alert\n"
+        "/remind <text> <duration> - Create a reminder\n"
+        "/reminders - List active reminders\n"
+        "/cancelreminder <id> - Cancel a reminder\n"
+        "/ask <question> - Ask the configured AI\n"
         "/mood <name> - Change the face mood\n"
-        "Moods: happy, sad, angry, sleepy, excited, love, suspicious, normal\n"
+        "Moods: happy, sad, angry, sleepy, excited, love, suspicious, normal, "
+        "cry, wink, laugh, shock, evil, tired, focus, confused, cool\n"
         "/config - Show the configuration page address", "");
     } else if (command == "/face") {
       selectDisplayMode(MODE_FACE);
@@ -667,6 +1178,57 @@ void handleTelegramMessages(int numNewMessages) {
         showNotification(title, message);
         telegramBot.sendMessage(chatId, String(TELEGRAM_OK) + "Notification displayed.", "");
       }
+    } else if (command == "/remind") {
+      String reminderTitle;
+      unsigned long durationMs = 0;
+      if (!parseReminderArguments(arguments, reminderTitle, durationMs)) {
+        telegramBot.sendMessage(chatId,
+          "Usage: /remind <text> <duration>\nSupported durations: 15m, 2h", "");
+      } else {
+        int reminderId = createReminder(reminderTitle, chatId, durationMs);
+        if (reminderId < 0) {
+          telegramBot.sendMessage(chatId,
+            "Reminder limit reached. Cancel one of the 10 active reminders first.", "");
+        } else {
+          telegramBot.sendMessage(chatId,
+            String(TELEGRAM_OK) + "Reminder created.\nID: " + reminderId, "");
+        }
+      }
+    } else if (command == "/reminders") {
+      telegramBot.sendMessage(chatId, listReminders(), "");
+    } else if (command == "/cancelreminder") {
+      bool validId = !arguments.isEmpty();
+      for (unsigned int j = 0; j < arguments.length(); j++) {
+        if (!isDigit(arguments[j])) {
+          validId = false;
+          break;
+        }
+      }
+      int reminderId = validId ? arguments.toInt() : 0;
+      if (reminderId <= 0 || reminderId > 255) {
+        telegramBot.sendMessage(chatId, "Usage: /cancelreminder <id>", "");
+      } else if (cancelReminder((uint8_t)reminderId)) {
+        telegramBot.sendMessage(chatId,
+          String(TELEGRAM_OK) + "Reminder cancelled.", "");
+      } else {
+        telegramBot.sendMessage(chatId, "Reminder not found.", "");
+      }
+    } else if (command == "/ask") {
+      if (arguments.isEmpty()) {
+        telegramBot.sendMessage(chatId, "Usage: /ask <question>", "");
+      } else {
+        setAIStatus(true, "Thinking...");
+        String answer = askAI(arguments);
+        if (answer.isEmpty()) {
+          setAIStatus(false, "AI unavailable", 3000);
+          telegramBot.sendMessage(chatId, "AI unavailable.", "");
+        } else {
+          setAIStatus(false, "Done!", 3000);
+          if (!sendTelegramLongMessage(chatId, answer)) {
+            Serial.println("Failed to send the complete AI response");
+          }
+        }
+      }
     } else if (command == "/mood") {
       String mood = arguments;
       mood.toLowerCase();
@@ -679,10 +1241,20 @@ void handleTelegramMessages(int numNewMessages) {
       else if (mood == "love") moodValue = MOOD_LOVE;
       else if (mood == "suspicious") moodValue = MOOD_SUSPICIOUS;
       else if (mood == "normal") moodValue = MOOD_NORMAL;
+      else if (mood == "cry") moodValue = MOOD_CRY;
+      else if (mood == "wink") moodValue = MOOD_WINK;
+      else if (mood == "laugh") moodValue = MOOD_LAUGH;
+      else if (mood == "shock") moodValue = MOOD_SHOCK;
+      else if (mood == "evil") moodValue = MOOD_EVIL;
+      else if (mood == "tired") moodValue = MOOD_TIRED;
+      else if (mood == "focus") moodValue = MOOD_FOCUS;
+      else if (mood == "confused") moodValue = MOOD_CONFUSED;
+      else if (mood == "cool") moodValue = MOOD_COOL;
 
       if (moodValue < 0) {
         telegramBot.sendMessage(chatId,
-          "Usage: /mood happy|sad|angry|sleepy|excited|love|suspicious|normal", "");
+          "Usage: /mood happy|sad|angry|sleepy|excited|love|suspicious|normal|"
+          "cry|wink|laugh|shock|evil|tired|focus|confused|cool", "");
       } else {
         selectMood(moodValue);
         telegramBot.sendMessage(chatId, String(TELEGRAM_OK) + "Mood changed to " + mood + ".", "");
@@ -703,11 +1275,13 @@ void telegramTask(void* parameter) {
   (void)parameter;
   for (;;) {
     if (WiFi.status() == WL_CONNECTED && !telegramBotToken.isEmpty()) {
+      sendPendingReminderNotices();
       int numNewMessages = telegramBot.getUpdates(telegramBot.last_message_received + 1);
       while (numNewMessages > 0) {
         handleTelegramMessages(numNewMessages);
         numNewMessages = telegramBot.getUpdates(telegramBot.last_message_received + 1);
       }
+      sendPendingReminderNotices();
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
@@ -789,6 +1363,238 @@ void getWeatherAndForecast() {
   if (weatherUpdated || forecastUpdated) requestCompleteRedraw();
 }
 
+void scheduleNextIdleAction(unsigned long fromTime) {
+  idleNextActionAt = fromTime + random(30000UL, 120001UL);
+}
+
+void startIdleAction(IdleAction action, unsigned long now) {
+  idleAction = action;
+  idleActionStarted = now;
+  idleBlinkCount = 0;
+
+  switch (action) {
+    case IDLE_LOOK_LEFT:
+    case IDLE_LOOK_RIGHT:
+    case IDLE_LOOK_UP:
+    case IDLE_LOOK_DOWN:
+      idleActionUntil = now + random(1200UL, 2401UL);
+      break;
+    case IDLE_BLINK:
+      idleActionUntil = now + 400;
+      break;
+    case IDLE_DOUBLE_BLINK:
+      idleActionUntil = now + 700;
+      break;
+    case IDLE_LONG_BLINK:
+      idleActionUntil = now + 1000;
+      break;
+    case IDLE_SLEEPY_BLINK:
+      idleActionUntil = now + 1400;
+      break;
+    case IDLE_STRETCH:
+      idleActionUntil = now + 1600;
+      break;
+    case IDLE_YAWN:
+      idleActionUntil = now + 2400;
+      break;
+    case IDLE_SLEEP:
+      idleActionUntil = now + random(5000UL, 9001UL);
+      break;
+    case IDLE_WAKE:
+      idleActionUntil = now + 1200;
+      break;
+    case IDLE_SCAN:
+      idleActionUntil = now + 2800;
+      break;
+    case IDLE_ZZZ:
+      idleActionUntil = now + 3500;
+      break;
+    case IDLE_NONE:
+      idleActionUntil = now;
+      break;
+  }
+}
+
+void finishIdleAction(unsigned long now) {
+  idleAction = IDLE_NONE;
+  idleActionStarted = 0;
+  idleActionUntil = 0;
+  leftEye.blinking = false;
+  rightEye.blinking = false;
+  leftEye.targetX = 18;
+  rightEye.targetX = 74;
+  leftEye.targetY = 14;
+  rightEye.targetY = 14;
+  leftEye.targetPupilX = rightEye.targetPupilX = 0;
+  leftEye.targetPupilY = rightEye.targetPupilY = 0;
+  lastSaccade = now;
+  saccadeInterval = random(1200UL, 3001UL);
+  leftEye.nextBlinkTime = now + random(1200UL, 3501UL);
+  rightEye.nextBlinkTime = leftEye.nextBlinkTime;
+  scheduleNextIdleAction(now);
+}
+
+void updateIdleBehavior(unsigned long now, bool aiStatusActive) {
+  DisplayMode mode;
+  bool notificationShowing;
+  bool resetRequested;
+  unsigned long activityTime;
+
+  portENTER_CRITICAL(&displayStateMux);
+  mode = currentMode;
+  notificationShowing = notificationActive;
+  activityTime = lastUserActivity;
+  resetRequested = idleResetRequested;
+  idleResetRequested = false;
+  portEXIT_CRITICAL(&displayStateMux);
+
+  if (resetRequested) {
+    finishIdleAction(now);
+    idleNextActionAt = activityTime + IDLE_INACTIVITY_MS
+      + random(30000UL, 120001UL);
+  }
+
+  if (mode != MODE_FACE || notificationShowing || aiStatusActive) {
+    if (idleAction != IDLE_NONE) finishIdleAction(now);
+    return;
+  }
+
+  if (now - activityTime < IDLE_INACTIVITY_MS) {
+    if (idleAction != IDLE_NONE) finishIdleAction(now);
+    if ((long)(idleNextActionAt - activityTime) < 0) {
+      idleNextActionAt = activityTime + IDLE_INACTIVITY_MS
+        + random(30000UL, 120001UL);
+    }
+    return;
+  }
+
+  if (idleAction != IDLE_NONE) {
+    if ((long)(now - idleActionUntil) >= 0) {
+      if (idleAction == IDLE_SLEEP) {
+        startIdleAction(IDLE_WAKE, now);
+      } else {
+        finishIdleAction(now);
+      }
+    }
+    return;
+  }
+
+  if (idleNextActionAt == 0) {
+    scheduleNextIdleAction(now);
+    return;
+  }
+  if ((long)(now - idleNextActionAt) < 0) return;
+
+  static const IdleAction naturalActions[] = {
+    IDLE_LOOK_LEFT, IDLE_LOOK_RIGHT, IDLE_LOOK_UP, IDLE_LOOK_DOWN,
+    IDLE_BLINK, IDLE_DOUBLE_BLINK, IDLE_LONG_BLINK, IDLE_SLEEPY_BLINK,
+    IDLE_STRETCH, IDLE_YAWN, IDLE_SLEEP, IDLE_SCAN, IDLE_ZZZ
+  };
+  int actionIndex = random(0, sizeof(naturalActions) / sizeof(naturalActions[0]));
+  startIdleAction(naturalActions[actionIndex], now);
+}
+
+void applyIdleActionTargets(unsigned long now) {
+  if (idleAction == IDLE_NONE) return;
+
+  unsigned long elapsed = now - idleActionStarted;
+  float progress = idleActionUntil > idleActionStarted
+    ? (float)elapsed / (float)(idleActionUntil - idleActionStarted)
+    : 1.0f;
+  if (progress > 1.0f) progress = 1.0f;
+
+  switch (idleAction) {
+    case IDLE_LOOK_LEFT:
+      leftEye.targetPupilX = rightEye.targetPupilX = -9;
+      leftEye.targetX = 15;
+      rightEye.targetX = 71;
+      break;
+    case IDLE_LOOK_RIGHT:
+      leftEye.targetPupilX = rightEye.targetPupilX = 9;
+      leftEye.targetX = 21;
+      rightEye.targetX = 77;
+      break;
+    case IDLE_LOOK_UP:
+      leftEye.targetPupilY = rightEye.targetPupilY = -6;
+      leftEye.targetY = rightEye.targetY = 12;
+      break;
+    case IDLE_LOOK_DOWN:
+      leftEye.targetPupilY = rightEye.targetPupilY = 6;
+      leftEye.targetY = rightEye.targetY = 16;
+      break;
+    case IDLE_BLINK:
+      if (elapsed >= 80 && elapsed < 260) {
+        leftEye.targetH = rightEye.targetH = 2;
+      }
+      break;
+    case IDLE_DOUBLE_BLINK:
+      if ((elapsed >= 60 && elapsed < 170)
+          || (elapsed >= 300 && elapsed < 430)) {
+        leftEye.targetH = rightEye.targetH = 2;
+      }
+      break;
+    case IDLE_LONG_BLINK:
+      if (elapsed >= 120 && elapsed < 820) {
+        leftEye.targetH = rightEye.targetH = 2;
+      }
+      break;
+    case IDLE_SLEEPY_BLINK:
+      leftEye.targetPupilY = rightEye.targetPupilY = 4;
+      if (elapsed >= 180 && elapsed < 1050) {
+        leftEye.targetH = rightEye.targetH = 5;
+      }
+      break;
+    case IDLE_STRETCH: {
+      float stretch = sin(progress * PI);
+      leftEye.targetW += 8 * stretch;
+      rightEye.targetW += 8 * stretch;
+      leftEye.targetH -= 6 * stretch;
+      rightEye.targetH -= 6 * stretch;
+      break;
+    }
+    case IDLE_YAWN: {
+      float yawn = sin(progress * PI);
+      leftEye.targetH = rightEye.targetH = 30 - 18 * yawn;
+      leftEye.targetPupilY = rightEye.targetPupilY = 5;
+      break;
+    }
+    case IDLE_SLEEP:
+      leftEye.targetH = rightEye.targetH = 2;
+      leftEye.targetPupilX = rightEye.targetPupilX = 0;
+      break;
+    case IDLE_WAKE: {
+      float wake = sin(progress * PI);
+      leftEye.targetH += 12 * wake;
+      rightEye.targetH += 12 * wake;
+      leftEye.targetW += 4 * wake;
+      rightEye.targetW += 4 * wake;
+      break;
+    }
+    case IDLE_SCAN: {
+      float scan = sin(progress * TWO_PI * 2.0f) * 10;
+      leftEye.targetPupilX = rightEye.targetPupilX = scan;
+      leftEye.targetX = 18 + scan * 0.25f;
+      rightEye.targetX = 74 + scan * 0.25f;
+      break;
+    }
+    case IDLE_ZZZ:
+      leftEye.targetH = rightEye.targetH = 2;
+      break;
+    case IDLE_NONE:
+      break;
+  }
+}
+
+void drawIdleOverlay(unsigned long now) {
+  if (idleAction == IDLE_YAWN) {
+    display.fillRoundRect(57, 49, 14, 13, 6, SSD1306_WHITE);
+    display.fillRoundRect(61, 52, 6, 8, 3, SSD1306_BLACK);
+  } else if (idleAction == IDLE_ZZZ || idleAction == IDLE_SLEEP) {
+    int y = 1 + ((now / 350) % 3);
+    display.drawBitmap(108, y, bmp_zzz, 16, 16, SSD1306_WHITE);
+  }
+}
+
 // ==================================================
 // 4. DRAWING & ANIMATION
 // ==================================================
@@ -840,6 +1646,47 @@ void drawEyelidMask(float x, float y, float w, float h, int mood, bool isLeft) {
       display.fillRect(ix, bottom - lowerLidDepth + 1, iw, lowerLidDepth, SSD1306_BLACK);
     }
   }
+  else if (mood == MOOD_CRY) {
+    if (isLeft) {
+      display.fillTriangle(ix, iy, right, iy, ix, iy + lidDepth, SSD1306_BLACK);
+    } else {
+      display.fillTriangle(ix, iy, right, iy, right, iy + lidDepth, SSD1306_BLACK);
+    }
+    display.fillTriangle(ix, bottom, right, bottom,
+                         ix + iw / 2, bottom - 2, SSD1306_BLACK);
+  }
+  else if (mood == MOOD_LAUGH) {
+    display.fillRect(ix, iy, iw, ih / 2, SSD1306_BLACK);
+    display.fillTriangle(ix, bottom, ix + iw / 3, bottom,
+                         ix, bottom - lidDepth, SSD1306_BLACK);
+    display.fillTriangle(right, bottom, right - iw / 3, bottom,
+                         right, bottom - lidDepth, SSD1306_BLACK);
+  }
+  else if (mood == MOOD_EVIL) {
+    if (isLeft) {
+      display.fillTriangle(ix, iy, right, iy, ix, iy + lidDepth + 2, SSD1306_BLACK);
+    } else {
+      display.fillTriangle(ix, iy, right, iy, right, iy + lidDepth + 2, SSD1306_BLACK);
+    }
+  }
+  else if (mood == MOOD_TIRED) {
+    display.fillRect(ix, iy, iw, min(ih / 3, 8), SSD1306_BLACK);
+  }
+  else if (mood == MOOD_FOCUS) {
+    int focusDepth = min(ih / 4, 5);
+    display.fillRect(ix, iy, iw, focusDepth, SSD1306_BLACK);
+    display.fillRect(ix, bottom - focusDepth + 1, iw, focusDepth, SSD1306_BLACK);
+  }
+  else if (mood == MOOD_CONFUSED) {
+    if (isLeft) {
+      display.fillRect(ix, iy, iw, lidDepth, SSD1306_BLACK);
+    } else {
+      display.fillRect(ix, bottom - 2, iw, 2, SSD1306_BLACK);
+    }
+  }
+  else if (mood == MOOD_COOL) {
+    display.fillRect(ix, iy, iw, min(ih / 4, 6), SSD1306_BLACK);
+  }
 }
 
 void drawUltraProEye(Eye& e, bool isLeft, int mood) {
@@ -848,6 +1695,12 @@ void drawUltraProEye(Eye& e, bool isLeft, int mood) {
   int iw = (int)e.w;
   int ih = (int)e.h;
   if (iw <= 0 || ih <= 0) return;
+
+  if (mood == MOOD_WINK && isLeft) {
+    int lineY = iy + max(0, ih / 2 - 1);
+    display.fillRoundRect(ix, lineY, iw, 3, 1, SSD1306_WHITE);
+    return;
+  }
 
   // 1. Draw Sclera (White base)
   int r = min(8, min(iw, ih) / 2);
@@ -863,8 +1716,15 @@ void drawUltraProEye(Eye& e, bool isLeft, int mood) {
   int cy = iy + ih / 2;
 
   // Pupil size is proportional to eye size
-  int pw = max(1, (int)(iw / 2.2f));
-  int ph = max(1, (int)(ih / 2.2f));
+  float pupilDivisor = 2.2f;
+  if (mood == MOOD_CRY) pupilDivisor = 3.0f;
+  else if (mood == MOOD_SHOCK) pupilDivisor = 3.2f;
+  else if (mood == MOOD_EVIL) pupilDivisor = 3.0f;
+  else if (mood == MOOD_FOCUS) pupilDivisor = 2.8f;
+  else if (mood == MOOD_TIRED || mood == MOOD_COOL) pupilDivisor = 2.5f;
+
+  int pw = max(1, (int)(iw / pupilDivisor));
+  int ph = max(1, (int)(ih / pupilDivisor));
   if (pw > iw) pw = iw;
   if (ph > ih) ph = ih;
 
@@ -895,30 +1755,64 @@ void drawUltraProEye(Eye& e, bool isLeft, int mood) {
   drawEyelidMask(e.x, e.y, e.w, e.h, mood, isLeft);
 }
 
+unsigned long blinkDurationForMood(int mood) {
+  switch (mood) {
+    case MOOD_SHOCK: return 70;
+    case MOOD_EVIL:
+    case MOOD_FOCUS: return 90;
+    case MOOD_CRY:
+    case MOOD_WINK: return 180;
+    case MOOD_TIRED:
+    case MOOD_COOL: return 240;
+    default: return 120;
+  }
+}
+
+unsigned long nextBlinkDelayForMood(int mood) {
+  switch (mood) {
+    case MOOD_SHOCK: return random(600UL, 1401UL);
+    case MOOD_LAUGH:
+    case MOOD_CONFUSED: return random(1600UL, 3501UL);
+    case MOOD_CRY:
+    case MOOD_WINK:
+    case MOOD_EVIL: return random(2500UL, 5001UL);
+    case MOOD_TIRED:
+    case MOOD_COOL: return random(3500UL, 7001UL);
+    case MOOD_FOCUS: return random(4500UL, 7501UL);
+    default: return random(2000UL, 6000UL);
+  }
+}
+
 void updatePhysicsAndMood(int mood) {
   unsigned long now = millis();
   breathVal = sin((now - breathStart) / 800.0) * 1.5;  // Breathing effect
 
   // --- BLINK LOGIC ---
-  if (now > leftEye.nextBlinkTime) {
-    leftEye.blinking = true;
-    leftEye.lastBlink = now;
-    rightEye.blinking = true;
-    rightEye.lastBlink = now;
-    leftEye.nextBlinkTime = now + random(2000, 6000);
-    rightEye.nextBlinkTime = leftEye.nextBlinkTime;
-  }
-  if (leftEye.blinking) {
-    leftEye.targetH = 2;
-    rightEye.targetH = 2;  // Close
-    if (now - leftEye.lastBlink > 120) {
-      leftEye.blinking = false;
-      rightEye.blinking = false;
+  if (idleAction == IDLE_NONE) {
+    if (now > leftEye.nextBlinkTime) {
+      leftEye.blinking = true;
+      leftEye.lastBlink = now;
+      rightEye.blinking = true;
+      rightEye.lastBlink = now;
+      leftEye.nextBlinkTime = now + nextBlinkDelayForMood(mood);
+      rightEye.nextBlinkTime = leftEye.nextBlinkTime;
     }
+    if (leftEye.blinking) {
+      leftEye.targetH = 2;
+      rightEye.targetH = 2;  // Close
+      if (now - leftEye.lastBlink > blinkDurationForMood(mood)) {
+        leftEye.blinking = false;
+        rightEye.blinking = false;
+      }
+    }
+  } else {
+    leftEye.blinking = false;
+    rightEye.blinking = false;
   }
 
   // --- SACCADE (Gaze) LOGIC ---
-  if (!leftEye.blinking && now - lastSaccade > saccadeInterval) {
+  if (idleAction == IDLE_NONE && !leftEye.blinking
+      && now - lastSaccade > saccadeInterval) {
     lastSaccade = now;
     saccadeInterval = random(500, 3000);
 
@@ -1023,9 +1917,91 @@ void updatePhysicsAndMood(int mood) {
         rightEye.targetW = 36;
         rightEye.targetH = 42;  // Right Wide
         break;
+      case MOOD_CRY: {
+        float sway = sin(now * 0.002f) * 2;
+        leftEye.targetW = rightEye.targetW = 34;
+        leftEye.targetH = rightEye.targetH = 38;
+        leftEye.targetPupilX = rightEye.targetPupilX = sway;
+        leftEye.targetPupilY = rightEye.targetPupilY = 4;
+        break;
+      }
+      case MOOD_WINK:
+        leftEye.targetW = 36;
+        leftEye.targetH = 2;
+        rightEye.targetW = 36;
+        rightEye.targetH = 36 + breathVal;
+        rightEye.targetPupilX = sin(now * 0.003f) * 4;
+        rightEye.targetPupilY = 0;
+        break;
+      case MOOD_LAUGH: {
+        float bounce = sin(now * 0.012f) * 2;
+        leftEye.targetW = rightEye.targetW = 40;
+        leftEye.targetH = rightEye.targetH = 28;
+        leftEye.targetY = rightEye.targetY = 14 + bounce;
+        leftEye.targetPupilY = rightEye.targetPupilY = bounce;
+        break;
+      }
+      case MOOD_SHOCK: {
+        float jitterX = random(-2, 3);
+        float jitterY = random(-1, 2);
+        leftEye.targetW = rightEye.targetW = 28;
+        leftEye.targetH = rightEye.targetH = 46;
+        leftEye.targetPupilX = rightEye.targetPupilX = jitterX;
+        leftEye.targetPupilY = rightEye.targetPupilY = jitterY;
+        break;
+      }
+      case MOOD_EVIL: {
+        float evilScan = sin(now * 0.006f) * 7;
+        leftEye.targetW = rightEye.targetW = 36;
+        leftEye.targetH = rightEye.targetH = 30;
+        leftEye.targetPupilX = rightEye.targetPupilX = evilScan;
+        leftEye.targetPupilY = rightEye.targetPupilY = 1;
+        break;
+      }
+      case MOOD_TIRED: {
+        float tiredScan = sin(now * 0.0015f) * 2;
+        leftEye.targetW = rightEye.targetW = 38;
+        leftEye.targetH = rightEye.targetH = 24;
+        leftEye.targetY = rightEye.targetY = 18;
+        leftEye.targetPupilX = rightEye.targetPupilX = tiredScan;
+        leftEye.targetPupilY = rightEye.targetPupilY = 3;
+        break;
+      }
+      case MOOD_FOCUS: {
+        float focusMove = sin(now * 0.001f);
+        leftEye.targetW = rightEye.targetW = 34;
+        leftEye.targetH = rightEye.targetH = 22;
+        leftEye.targetX = 19;
+        rightEye.targetX = 73;
+        leftEye.targetY = rightEye.targetY = 20;
+        leftEye.targetPupilX = rightEye.targetPupilX = focusMove;
+        leftEye.targetPupilY = rightEye.targetPupilY = 0;
+        break;
+      }
+      case MOOD_CONFUSED: {
+        float alternate = sin(now * 0.004f);
+        leftEye.targetW = 34 + alternate * 4;
+        leftEye.targetH = 36 + alternate * 5;
+        rightEye.targetW = 36 - alternate * 4;
+        rightEye.targetH = 34 - alternate * 5;
+        leftEye.targetPupilX = sin(now * 0.007f) * 3;
+        rightEye.targetPupilX = cos(now * 0.006f) * 3;
+        leftEye.targetPupilY = -alternate * 2;
+        rightEye.targetPupilY = alternate * 2;
+        break;
+      }
+      case MOOD_COOL: {
+        float coolScan = sin(now * 0.0018f) * 5;
+        leftEye.targetW = rightEye.targetW = 36;
+        leftEye.targetH = rightEye.targetH = 31;
+        leftEye.targetPupilX = rightEye.targetPupilX = coolScan;
+        leftEye.targetPupilY = rightEye.targetPupilY = 1;
+        break;
+      }
     }
   }
 
+  applyIdleActionTargets(now);
   leftEye.update();
   rightEye.update();
 
@@ -1059,6 +2035,15 @@ void updateParticles(int mood) {
     }
 
   }
+
+  if (mood == MOOD_CRY) {
+    unsigned long tearFrame = millis() / 70;
+    for (int i = 0; i < 4; i++) {
+      int tearX = (i % 2 == 0 ? 38 : 94) + (i / 2) * 3;
+      int tearY = 38 + ((tearFrame + i * 9) % 25);
+      display.drawBitmap(tearX, tearY, bmp_tiny_drop, 8, 8, SSD1306_WHITE);
+    }
+  }
 }
 
 void drawEmoPage(int mood) {
@@ -1069,6 +2054,7 @@ void drawEmoPage(int mood) {
 
   drawUltraProEye(leftEye, true, mood);
   drawUltraProEye(rightEye, false, mood);
+  drawIdleOverlay(millis());
 }
 void drawNotification() {
   // Notification হেডার আঁকা
@@ -1096,6 +2082,30 @@ void drawNotification() {
   display.print(titleToShow);
   display.setCursor(0, 44);
   display.print(msgToShow);
+}
+
+void drawAIStatus(bool thinking, const char* status) {
+  display.setFont(NULL);
+  display.setTextSize(1);
+
+  if (thinking) {
+    display.fillRect(0, 0, SCREEN_WIDTH, 12, SSD1306_BLACK);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(42, 2);
+    display.print("Thinking...");
+    return;
+  }
+
+  display.setTextColor(SSD1306_WHITE);
+  if (strcmp(status, "Done!") == 0) {
+    display.setCursor(50, 24);
+    display.print("Done!");
+    display.setCursor(37, 40);
+    display.print("Check Telegram");
+  } else {
+    display.setCursor(27, 31);
+    display.print(status);
+  }
 }
 
 // --- STANDARD PAGES ---
@@ -1157,6 +2167,72 @@ void drawClock() {
   display.setCursor((SCREEN_WIDTH - w) / 2, 62);
   display.print(dateStr);
 }
+
+void drawWeatherAnimation() {
+  unsigned long now = millis();
+  uint16_t frame = now / 80;
+
+  if (weatherMain == "Clear") {
+    int phase = (frame / 2) % 4;
+    display.drawLine(91 - phase, 4, 94 - phase, 7, SSD1306_WHITE);
+    display.drawLine(88, 15 + phase, 93, 15 + phase, SSD1306_WHITE);
+    display.drawLine(91 + phase, 27, 94 + phase, 24, SSD1306_WHITE);
+  }
+  else if (weatherMain == "Clouds") {
+    int cloudX = 73 + ((frame / 4) % 18);
+    display.drawBitmap(cloudX, 16, mini_cloud, 16, 16, SSD1306_WHITE);
+    display.drawBitmap(58 + ((frame / 7) % 13), 34,
+                       mini_cloud, 16, 16, SSD1306_WHITE);
+  }
+  else if (weatherMain == "Rain" || weatherMain == "Drizzle") {
+    int dropCount = weatherMain == "Drizzle" ? 4 : 8;
+    int travel = weatherMain == "Drizzle" ? 22 : 34;
+    int speed = weatherMain == "Drizzle" ? 1 : 3;
+    for (int i = 0; i < dropCount; i++) {
+      int x = 58 + ((i * 13 + (frame / 5)) % 34);
+      int y = 12 + ((frame * speed + i * 9) % travel);
+      if (weatherMain == "Drizzle") {
+        display.drawPixel(x, y, SSD1306_WHITE);
+      } else {
+        display.drawLine(x, y, x - 1, y + 3, SSD1306_WHITE);
+      }
+    }
+  }
+  else if (weatherMain == "Thunderstorm") {
+    bool flash = (now % 2400UL) < 120;
+    if (flash) {
+      display.drawRoundRect(93, 0, 35, 33, 6, SSD1306_WHITE);
+      display.fillTriangle(81, 18, 91, 18, 85, 31, SSD1306_WHITE);
+      display.fillTriangle(85, 29, 91, 27, 82, 44, SSD1306_WHITE);
+    } else {
+      display.drawLine(87, 24, 83, 34, SSD1306_WHITE);
+      display.drawLine(83, 34, 88, 32, SSD1306_WHITE);
+      display.drawLine(88, 32, 84, 43, SSD1306_WHITE);
+    }
+  }
+  else if (weatherMain == "Snow") {
+    for (int i = 0; i < 10; i++) {
+      int x = 53 + ((i * 17 + frame / 3) % 42);
+      int y = (frame + i * 11) % 51;
+      display.drawPixel(x, y, SSD1306_WHITE);
+      if ((i & 1) == 0) display.drawPixel(x + 1, y, SSD1306_WHITE);
+    }
+  }
+  else if (weatherMain == "Mist") {
+    for (int i = 0; i < 8; i++) {
+      int x = 52 + ((i * 19 + frame) % 43);
+      int y = 6 + ((i * 13 + frame / 6) % 40);
+      display.drawPixel(x, y, SSD1306_WHITE);
+    }
+  }
+  else if (weatherMain == "Fog") {
+    int offset = (frame / 3) % 12;
+    display.drawLine(50 + offset, 12, 78 + offset, 12, SSD1306_WHITE);
+    display.drawLine(57 - offset, 26, 91 - offset, 26, SSD1306_WHITE);
+    display.drawLine(49 + offset, 41, 82 + offset, 41, SSD1306_WHITE);
+  }
+}
+
 void drawWeatherCard() {
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
@@ -1174,6 +2250,7 @@ void drawWeatherCard() {
     display.print("Please wait");
     return;
   }
+  drawWeatherAnimation();
   display.drawBitmap(96, 0, getBigIcon(weatherMain), 32, 32, SSD1306_WHITE);
   display.setFont(&FreeSansBold9pt7b);
   String c = city;
@@ -1284,6 +2361,14 @@ Wire.begin(SDA_PIN, SCL_PIN);
 displayTaskHandle = xTaskGetCurrentTaskHandle();
 notificationMutex = xSemaphoreCreateMutex();
 buzzerMutex = xSemaphoreCreateMutex();
+reminderMutex = xSemaphoreCreateMutex();
+aiStatusMutex = xSemaphoreCreateMutex();
+reminderNoticeQueue = xQueueCreate(MAX_REMINDERS, sizeof(ReminderTelegramNotice));
+reminderPopupQueue = xQueueCreate(MAX_REMINDERS, sizeof(ReminderTelegramNotice));
+randomSeed(esp_random());
+lastUserActivity = millis();
+idleNextActionAt = lastUserActivity + IDLE_INACTIVITY_MS
+  + random(30000UL, 120001UL);
 detectBuzzerDriveMode();
 display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.setTextColor(SSD1306_WHITE);
@@ -1352,7 +2437,7 @@ delay(4000);
     Serial.println("Telegram bot token is not configured");
   }
 
-  for(int i=0;i<PARTICLE_COUNT;i++){
+for(int i=0;i<PARTICLE_COUNT;i++){
   particles[i].x = random(0,120);
   particles[i].y = random(0,64);
   particles[i].speed = random(1,3);
@@ -1361,11 +2446,14 @@ delay(4000);
 
 void loop() {
   configServer.handleClient();
+  updateBuzzer();
 
   if (inConfigMode) {
     return;
   }
   unsigned long now = millis();
+  checkReminders(now);
+  showNextReminderPopup();
   bool notificationClosed = false;
   DisplayMode restoredMode = MODE_FACE;
 
@@ -1391,6 +2479,12 @@ void loop() {
   DisplayMode modeToDraw;
   int moodToDraw;
   uint32_t stateVersionToDraw;
+  bool aiThinkingNow;
+  char aiStatusNow[AI_STATUS_LENGTH];
+  bool aiStatusActive = getAIStatusSnapshot(now, aiThinkingNow,
+                                             aiStatusNow, sizeof(aiStatusNow));
+
+  updateIdleBehavior(now, aiStatusActive);
 
   portENTER_CRITICAL(&displayStateMux);
   showNotificationNow = notificationActive;
@@ -1409,16 +2503,23 @@ void loop() {
 
   if (showNotificationNow) {
     drawNotification();
+  } else if (aiStatusActive && !aiThinkingNow) {
+    drawAIStatus(false, aiStatusNow);
   } else {
-    switch (modeToDraw) {
-      case MODE_FACE: drawEmoPage(moodToDraw); break;
-      case MODE_CLOCK: drawClock(); break;
-      case MODE_WEATHER:
-        if (forceRedrawNow) Serial.println("drawWeatherCard() called");
-        drawWeatherCard();
-        break;
-      case MODE_FORECAST: drawForecastPage(); break;
-      case MODE_WORLD: drawWorldClock(); break;
+    if (aiStatusActive && aiThinkingNow) {
+      drawEmoPage(moodToDraw);
+      drawAIStatus(true, aiStatusNow);
+    } else {
+      switch (modeToDraw) {
+        case MODE_FACE: drawEmoPage(moodToDraw); break;
+        case MODE_CLOCK: drawClock(); break;
+        case MODE_WEATHER:
+          if (forceRedrawNow) Serial.println("drawWeatherCard() called");
+          drawWeatherCard();
+          break;
+        case MODE_FORECAST: drawForecastPage(); break;
+        case MODE_WORLD: drawWorldClock(); break;
+      }
     }
   }
 
