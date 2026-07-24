@@ -77,6 +77,7 @@ SemaphoreHandle_t reminderMutex;
 SemaphoreHandle_t aiStatusMutex;
 SemaphoreHandle_t telegramMutex;
 TaskHandle_t displayTaskHandle = NULL;
+TaskHandle_t telegramTaskHandle = NULL;
 bool faceResetRequested = true;
 bool displayRedrawRequested = true;
 bool weatherRefreshRequested = false;
@@ -127,10 +128,51 @@ portMUX_TYPE aiRequestMux = portMUX_INITIALIZER_UNLOCKED;
 bool aiRequestBusy = false;
 HTTPClient aiHttpClient;
 JsonDocument aiJsonDocument;
+JsonDocument aiFilterDocument;
 char aiRequestBody[AI_REQUEST_BODY_LENGTH];
 char aiResponseJson[AI_RESPONSE_JSON_LENGTH];
 char aiAnswer[AI_ANSWER_LENGTH];
 long lastProcessedTelegramUpdate = 0;
+
+class BoundedBufferStream : public Stream {
+ public:
+  BoundedBufferStream(char* buffer, size_t capacity)
+      : buffer_(buffer), capacity_(capacity), length_(0), overflowed_(false) {
+    if (capacity_ > 0) buffer_[0] = '\0';
+  }
+
+  size_t write(uint8_t value) override {
+    return write(&value, 1);
+  }
+
+  size_t write(const uint8_t* data, size_t size) override {
+    if (capacity_ == 0 || length_ >= capacity_ - 1) {
+      overflowed_ = overflowed_ || size > 0;
+      return 0;
+    }
+
+    size_t available = capacity_ - 1 - length_;
+    size_t toCopy = min(size, available);
+    memcpy(buffer_ + length_, data, toCopy);
+    length_ += toCopy;
+    buffer_[length_] = '\0';
+    if (toCopy != size) overflowed_ = true;
+    return toCopy;
+  }
+
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+  size_t length() const { return length_; }
+  bool overflowed() const { return overflowed_; }
+
+ private:
+  char* buffer_;
+  size_t capacity_;
+  size_t length_;
+  bool overflowed_;
+};
 
 #define PARTICLE_COUNT 6
 
@@ -208,6 +250,8 @@ String weatherDesc = "Wait...";
 bool weatherDataAvailable = false;
 bool forecastDataAvailable = false;
 const char* TELEGRAM_OK = "\xE2\x9C\x85 ";
+const char* TELEGRAM_AI_BUSY =
+  "\xE2\x8F\xB3 AI is already processing another request.";
 
 struct ForecastDay {
   String dayName;
@@ -400,11 +444,12 @@ bool inConfigMode = false;
 bool configRoutesRegistered = false;
 WiFiClientSecure telegramClient;
 WiFiClientSecure aiClient;
+WiFiClient aiPlainClient;
 UniversalTelegramBot telegramBot("", telegramClient);
 
 void handleNotify();
 void beep(int duration = 150);
-String askAI(String prompt);
+bool askAI(const char* prompt, char* answer, size_t answerLength);
 void noteUserActivity();
 
 void loadConfig() {
@@ -1031,19 +1076,24 @@ void sendPendingReminderNotices() {
   }
 }
 
-bool sendTelegramLongMessage(const String& chatId, const String& message) {
+bool sendTelegramLongMessage(const char* chatId, const char* message) {
   const unsigned int chunkSize = 1200;
-  unsigned int start = 0;
+  const size_t messageLength = strlen(message);
+  size_t start = 0;
   bool sentAll = true;
+  String chunk;
+  chunk.reserve(chunkSize);
 
-  while (start < message.length()) {
-    unsigned int end = min(start + chunkSize, message.length());
-    while (end < message.length() && end > start
+  while (start < messageLength) {
+    size_t end = min(start + chunkSize, messageLength);
+    while (end < messageLength && end > start
            && (((uint8_t)message[end] & 0xC0) == 0x80)) {
       end--;
     }
-    if (end == start) end = min(start + chunkSize, message.length());
-    if (!telegramBot.sendMessage(chatId, message.substring(start, end), "")) {
+    if (end == start) end = min(start + chunkSize, messageLength);
+    chunk = "";
+    if (!chunk.concat(message + start, end - start)
+        || !telegramBot.sendMessage(chatId, chunk, "")) {
       sentAll = false;
       break;
     }
@@ -1052,71 +1102,250 @@ bool sendTelegramLongMessage(const String& chatId, const String& message) {
   return sentAll;
 }
 
-String askAI(String prompt) {
-  if (WiFi.status() != WL_CONNECTED || aiApiUrl.isEmpty()
-      || aiModel.isEmpty()) {
-    return "";
+void logTaskStackUsage(const char* taskName, TaskHandle_t taskHandle,
+                       size_t stackSize) {
+  if (taskHandle == NULL || stackSize == 0) return;
+  size_t minimumFree = uxTaskGetStackHighWaterMark(taskHandle);
+  size_t used = minimumFree < stackSize ? stackSize - minimumFree : 0;
+  unsigned int usedPercent = (unsigned int)((used * 100U) / stackSize);
+  Serial.printf("%s Task Stack: %u/%u bytes used (%u%%), minimum free: %u\n",
+                taskName, (unsigned int)used, (unsigned int)stackSize,
+                usedPercent, (unsigned int)minimumFree);
+  if (usedPercent > 80) {
+    Serial.printf("WARNING: %s task stack usage exceeds 80%%\n", taskName);
+  }
+}
+
+void logAIHeap(const char* phase) {
+  Serial.printf("Heap %s: %lu bytes\n", phase,
+                (unsigned long)ESP.getFreeHeap());
+  Serial.printf("Largest free block %s: %lu bytes\n", phase,
+                (unsigned long)heap_caps_get_largest_free_block(
+                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
+
+void setAIRequestBusy(bool busy) {
+  portENTER_CRITICAL(&aiRequestMux);
+  aiRequestBusy = busy;
+  portEXIT_CRITICAL(&aiRequestMux);
+}
+
+bool reserveAIRequest() {
+  bool reserved = false;
+  portENTER_CRITICAL(&aiRequestMux);
+  if (!aiRequestBusy) {
+    aiRequestBusy = true;
+    reserved = true;
+  }
+  portEXIT_CRITICAL(&aiRequestMux);
+  return reserved;
+}
+
+bool queueAIRequest(const String& chatId, const String& prompt) {
+  if (aiRequestQueue == NULL || aiTaskHandle == NULL
+      || chatId.length() >= sizeof(AIRequest::chatId)
+      || prompt.length() >= sizeof(AIRequest::prompt)) {
+    return false;
   }
 
-  HTTPClient http;
-  http.setConnectTimeout(8000);
-  http.setTimeout(20000);
+  AIRequest request = {};
+  snprintf(request.chatId, sizeof(request.chatId), "%s", chatId.c_str());
+  snprintf(request.prompt, sizeof(request.prompt), "%s", prompt.c_str());
+  return xQueueSend(aiRequestQueue, &request, 0) == pdTRUE;
+}
 
-  bool started = false;
-  if (aiApiUrl.startsWith("https://")) {
-    aiClient.setInsecure();
-    started = http.begin(aiClient, aiApiUrl);
+void persistTelegramUpdate(long updateId) {
+  if (updateId <= lastProcessedTelegramUpdate) return;
+  prefs.begin("microbot", false);
+  size_t stored = prefs.putLong("tgupdate", updateId);
+  prefs.end();
+  if (stored == sizeof(int32_t)) {
+    lastProcessedTelegramUpdate = updateId;
   } else {
-    started = http.begin(aiApiUrl);
+    Serial.println("Failed to persist Telegram update ID");
   }
-  if (!started) return "";
+}
 
-  http.addHeader("Content-Type", "application/json");
-  if (!aiApiKey.isEmpty()) {
-    http.addHeader("Authorization", "Bearer " + aiApiKey);
+bool askAI(const char* prompt, char* answer, size_t answerLength) {
+  bool success = false;
+  bool started = false;
+  if (answer == nullptr || answerLength < 2) return false;
+  answer[0] = '\0';
+  aiRequestBody[0] = '\0';
+  aiResponseJson[0] = '\0';
+  aiHttpClient.end();
+  aiJsonDocument.clear();
+
+  do {
+    if (WiFi.status() != WL_CONNECTED || aiApiUrl.isEmpty()
+        || aiModel.isEmpty()) {
+      Serial.println("AI configuration or WiFi is unavailable");
+      break;
+    }
+
+    aiJsonDocument["model"] = aiModel;
+    aiJsonDocument["messages"][0]["role"] = "user";
+    aiJsonDocument["messages"][0]["content"] = prompt;
+    aiJsonDocument["max_tokens"] = 256;
+    size_t bodyLength = measureJson(aiJsonDocument);
+    if (bodyLength >= sizeof(aiRequestBody)) {
+      Serial.println("AI request JSON exceeded the fixed request buffer");
+      break;
+    }
+    if (serializeJson(aiJsonDocument, aiRequestBody,
+                      sizeof(aiRequestBody)) != bodyLength) {
+      Serial.println("Failed to serialize the AI request");
+      break;
+    }
+    aiJsonDocument.clear();
+
+    aiHttpClient.setReuse(false);
+    aiHttpClient.setConnectTimeout(5000);
+    aiHttpClient.setTimeout(10000);
+    if (aiApiUrl.startsWith("https://")) {
+      aiClient.setInsecure();
+      aiClient.setHandshakeTimeout(5);
+      started = aiHttpClient.begin(aiClient, aiApiUrl);
+    } else {
+      started = aiHttpClient.begin(aiPlainClient, aiApiUrl);
+    }
+    if (!started) {
+      Serial.println("Failed to start the AI HTTP connection");
+      break;
+    }
+
+    aiHttpClient.addHeader("Content-Type", "application/json");
+    if (!aiApiKey.isEmpty()) {
+      String authorization;
+      authorization.reserve(aiApiKey.length() + 8);
+      authorization = "Bearer ";
+      authorization += aiApiKey;
+      aiHttpClient.addHeader("Authorization", authorization);
+    }
+
+    int httpCode = aiHttpClient.POST(
+      reinterpret_cast<uint8_t*>(aiRequestBody), bodyLength);
+    if (httpCode < 200 || httpCode >= 300) {
+      Serial.printf("AI request failed, HTTP %d (%s)\n", httpCode,
+                    aiHttpClient.errorToString(httpCode).c_str());
+      break;
+    }
+
+    int responseLength = aiHttpClient.getSize();
+    if (responseLength >= (int)sizeof(aiResponseJson)) {
+      Serial.printf("AI response rejected: %d-byte body exceeds %u-byte limit\n",
+                    responseLength, (unsigned int)sizeof(aiResponseJson) - 1);
+      break;
+    }
+
+    BoundedBufferStream responseStream(aiResponseJson,
+                                       sizeof(aiResponseJson));
+    int bytesRead = aiHttpClient.writeToStream(&responseStream);
+    if (bytesRead < 0 || responseStream.overflowed()) {
+      Serial.printf("AI response read failed or exceeded limit (%d)\n",
+                    bytesRead);
+      break;
+    }
+
+    DeserializationError error = deserializeJson(
+      aiJsonDocument, aiResponseJson,
+      DeserializationOption::Filter(aiFilterDocument),
+      DeserializationOption::NestingLimit(8));
+    if (error) {
+      Serial.printf("AI response JSON parse failed: %s\n", error.c_str());
+      break;
+    }
+
+    const char* content =
+      aiJsonDocument["choices"][0]["message"]["content"] | nullptr;
+    if (content == nullptr || content[0] == '\0') {
+      const char* apiError = aiJsonDocument["error"]["message"] | nullptr;
+      Serial.printf("AI response format was invalid%s%s\n",
+                    apiError == nullptr ? "" : ": ",
+                    apiError == nullptr ? "" : apiError);
+      break;
+    }
+
+    size_t contentLength = strlen(content);
+    size_t contentStart = 0;
+    while (contentStart < contentLength
+           && isspace((unsigned char)content[contentStart])) {
+      contentStart++;
+    }
+    while (contentLength > contentStart
+           && isspace((unsigned char)content[contentLength - 1])) {
+      contentLength--;
+    }
+    size_t trimmedLength = contentLength - contentStart;
+    size_t copyLength = min(trimmedLength, answerLength - 1);
+    while (copyLength > 0 && copyLength < trimmedLength
+           && (((uint8_t)content[contentStart + copyLength] & 0xC0) == 0x80)) {
+      copyLength--;
+    }
+    memcpy(answer, content + contentStart, copyLength);
+    answer[copyLength] = '\0';
+    success = copyLength > 0;
+  } while (false);
+
+  aiHttpClient.end();
+  if (started) {
+    aiClient.stop();
+    aiPlainClient.stop();
   }
+  aiJsonDocument.clear();
+  aiRequestBody[0] = '\0';
+  aiResponseJson[0] = '\0';
+  return success;
+}
 
-  JSONVar message;
-  message["role"] = "user";
-  message["content"] = prompt;
-  JSONVar messages;
-  messages[0] = message;
-  JSONVar request;
-  request["model"] = aiModel;
-  request["messages"] = messages;
+void aiTask(void* parameter) {
+  (void)parameter;
+  AIRequest request;
+  for (;;) {
+    if (xQueueReceive(aiRequestQueue, &request, portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
 
-  int httpCode = http.POST(JSON.stringify(request));
-  if (httpCode < 200 || httpCode >= 300) {
-    Serial.print("AI request failed, HTTP ");
-    Serial.println(httpCode);
-    http.end();
-    return "";
+    logAIHeap("before");
+    logTaskStackUsage("AI", aiTaskHandle, AI_TASK_STACK_SIZE);
+    bool success = askAI(request.prompt, aiAnswer, sizeof(aiAnswer));
+    bool replySent = false;
+
+    if (telegramMutex != NULL
+        && xSemaphoreTake(telegramMutex, portMAX_DELAY) == pdTRUE) {
+      if (success) {
+        replySent = sendTelegramLongMessage(request.chatId, aiAnswer);
+      } else {
+        replySent = telegramBot.sendMessage(
+          request.chatId, "AI unavailable.", "");
+      }
+      xSemaphoreGive(telegramMutex);
+    } else {
+      Serial.println("AI reply could not acquire the Telegram mutex");
+    }
+
+    if (!replySent) {
+      Serial.println("Failed to send the AI response");
+    }
+    setAIStatus(false, success && replySent ? "Done!" : "AI unavailable",
+                3000);
+    aiAnswer[0] = '\0';
+    setAIRequestBusy(false);
+    logAIHeap("after");
+    logTaskStackUsage("AI", aiTaskHandle, AI_TASK_STACK_SIZE);
   }
-
-  String payload = http.getString();
-  http.end();
-  JSONVar response = JSON.parse(payload);
-  bool validResponse = JSON.typeof(response) == "object"
-    && response.hasOwnProperty("choices")
-    && JSON.typeof(response["choices"]) == "array"
-    && response["choices"].length() > 0
-    && JSON.typeof(response["choices"][0]) == "object"
-    && response["choices"][0].hasOwnProperty("message")
-    && JSON.typeof(response["choices"][0]["message"]) == "object"
-    && response["choices"][0]["message"].hasOwnProperty("content")
-    && JSON.typeof(response["choices"][0]["message"]["content"]) == "string";
-  if (!validResponse) {
-    Serial.println("AI response format was not OpenAI-compatible");
-    return "";
-  }
-
-  String answer = (const char*)response["choices"][0]["message"]["content"];
-  answer.trim();
-  return answer;
 }
 
 void handleTelegramMessages(int numNewMessages) {
   for (int i = 0; i < numNewMessages; i++) {
+    long updateId = telegramBot.messages[i].update_id;
+    if (updateId <= lastProcessedTelegramUpdate) {
+      Serial.printf("Skipping already processed Telegram update %ld\n",
+                    updateId);
+      continue;
+    }
+    persistTelegramUpdate(updateId);
+
     String chatId = telegramBot.messages[i].chat_id;
     String text = telegramBot.messages[i].text;
     text.trim();
@@ -1216,18 +1445,19 @@ void handleTelegramMessages(int numNewMessages) {
     } else if (command == "/ask") {
       if (arguments.isEmpty()) {
         telegramBot.sendMessage(chatId, "Usage: /ask <question>", "");
+      } else if (arguments.length() >= AI_PROMPT_LENGTH) {
+        telegramBot.sendMessage(chatId, "AI question is too long.", "");
+      } else if (!reserveAIRequest()) {
+        telegramBot.sendMessage(chatId, TELEGRAM_AI_BUSY, "");
       } else {
         setAIStatus(true, "Thinking...");
-        String answer = askAI(arguments);
-        if (answer.isEmpty()) {
+        if (!queueAIRequest(chatId, arguments)) {
+          setAIRequestBusy(false);
           setAIStatus(false, "AI unavailable", 3000);
           telegramBot.sendMessage(chatId, "AI unavailable.", "");
-        } else {
-          setAIStatus(false, "Done!", 3000);
-          if (!sendTelegramLongMessage(chatId, answer)) {
-            Serial.println("Failed to send the complete AI response");
-          }
         }
+        logTaskStackUsage("Telegram", telegramTaskHandle,
+                          TELEGRAM_TASK_STACK_SIZE);
       }
     } else if (command == "/mood") {
       String mood = arguments;
@@ -1273,15 +1503,28 @@ void handleTelegramMessages(int numNewMessages) {
 
 void telegramTask(void* parameter) {
   (void)parameter;
+  unsigned long lastStackLog = 0;
   for (;;) {
     if (WiFi.status() == WL_CONNECTED && !telegramBotToken.isEmpty()) {
-      sendPendingReminderNotices();
-      int numNewMessages = telegramBot.getUpdates(telegramBot.last_message_received + 1);
-      while (numNewMessages > 0) {
-        handleTelegramMessages(numNewMessages);
-        numNewMessages = telegramBot.getUpdates(telegramBot.last_message_received + 1);
+      if (telegramMutex != NULL
+          && xSemaphoreTake(telegramMutex, 0) == pdTRUE) {
+        sendPendingReminderNotices();
+        int numNewMessages =
+          telegramBot.getUpdates(telegramBot.last_message_received + 1);
+        while (numNewMessages > 0) {
+          handleTelegramMessages(numNewMessages);
+          numNewMessages =
+            telegramBot.getUpdates(telegramBot.last_message_received + 1);
+        }
+        sendPendingReminderNotices();
+        xSemaphoreGive(telegramMutex);
       }
-      sendPendingReminderNotices();
+    }
+    unsigned long now = millis();
+    if (now - lastStackLog >= 60000) {
+      logTaskStackUsage("Telegram", telegramTaskHandle,
+                        TELEGRAM_TASK_STACK_SIZE);
+      lastStackLog = now;
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
@@ -2363,8 +2606,12 @@ notificationMutex = xSemaphoreCreateMutex();
 buzzerMutex = xSemaphoreCreateMutex();
 reminderMutex = xSemaphoreCreateMutex();
 aiStatusMutex = xSemaphoreCreateMutex();
+telegramMutex = xSemaphoreCreateMutex();
 reminderNoticeQueue = xQueueCreate(MAX_REMINDERS, sizeof(ReminderTelegramNotice));
 reminderPopupQueue = xQueueCreate(MAX_REMINDERS, sizeof(ReminderTelegramNotice));
+aiRequestQueue = xQueueCreate(1, sizeof(AIRequest));
+aiFilterDocument["choices"][0]["message"]["content"] = true;
+aiFilterDocument["error"]["message"] = true;
 randomSeed(esp_random());
 lastUserActivity = millis();
 idleNextActionAt = lastUserActivity + IDLE_INACTIVITY_MS
@@ -2424,13 +2671,27 @@ delay(4000);
   telegramClient.setCACert(TELEGRAM_CERTIFICATE_ROOT);
   telegramBot.updateToken(telegramBotToken);
   telegramBot.waitForResponse = 1000;
+  prefs.begin("microbot", true);
+  lastProcessedTelegramUpdate = prefs.getLong("tgupdate", 0);
+  prefs.end();
+  telegramBot.last_message_received = lastProcessedTelegramUpdate;
   getWeatherAndForecast();
   lastWeatherUpdate = millis();
 
   if (!telegramBotToken.isEmpty()) {
-    BaseType_t taskResult = xTaskCreatePinnedToCore(
-      telegramTask, "telegramBot", 16384, NULL, 1, NULL, 0);
-    if (taskResult != pdPASS) {
+    if (aiRequestQueue == NULL || aiFilterDocument.overflowed()) {
+      Serial.println("AI worker resources could not be allocated");
+    } else {
+      BaseType_t aiTaskResult = xTaskCreatePinnedToCore(
+        aiTask, "aiWorker", AI_TASK_STACK_SIZE, NULL, 1, &aiTaskHandle, 0);
+      if (aiTaskResult != pdPASS) {
+        Serial.println("Failed to start AI task");
+      }
+    }
+    BaseType_t telegramTaskResult = xTaskCreatePinnedToCore(
+      telegramTask, "telegramBot", TELEGRAM_TASK_STACK_SIZE, NULL, 1,
+      &telegramTaskHandle, 0);
+    if (telegramTaskResult != pdPASS) {
       Serial.println("Failed to start Telegram task");
     }
   } else {

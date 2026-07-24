@@ -114,6 +114,67 @@ Fill in WiFi, weather key, city, timezone, Telegram token, and (optionally) an A
 
 > ⚠️ **Heads up:** replace the placeholder fallback credentials in `loadConfig()` with your own (or leave them blank and use the portal). Never commit real keys.
 
+### ⚙️ MacroDroid Setup
+
+#### Trigger
+
+```
+Notification Received
+```
+
+Choose:
+
+```
+Any Application
+```
+
+or select only the apps you want.
+
+---
+
+#### Action
+
+```
+HTTP Request (GET)
+```
+
+URL:
+
+```text
+http://192.168.1.131/notify?title={not_app_name}&msg={not_title}
+```
+
+Replace:
+
+```
+192.168.1.131
+```
+
+with your own MicroBot IP.
+
+---
+
+### Available Variables
+
+| Variable | Description |
+|-----------|-------------|
+| `{not_app_name}` | App name (WhatsApp, Telegram, Gmail...) |
+| `{not_title}` | Notification title |
+| `{not_text}` | Notification content (optional) |
+
+For full notification content:
+
+```text
+http://192.168.1.131/notify?title={not_app_name}&msg={not_text}
+```
+
+or combine both:
+
+```text
+http://192.168.1.131/notify?title={not_app_name}&msg={not_title}%0A{not_text}
+```
+
+
 ## 💬 Telegram commands
 
 | Command | What happens |
